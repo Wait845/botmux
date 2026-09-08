@@ -468,3 +468,55 @@ describe('ordinary recovery session registry', () => {
     });
   });
 });
+
+describe('continuation identity', () => {
+  function drive(mint: ((logicalTurnId: string, continuation: number) => string | undefined) | undefined, logicalTurnId: string) {
+    const scheduled: Array<() => void> = [];
+    const enqueue = vi.fn(() => true);
+    const persist = vi.fn();
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => { scheduled.push(run); return run; },
+      cancel: vi.fn(),
+      persist,
+      enqueue,
+      warn: vi.fn(),
+      randomId: () => 'rand',
+      ...(mint ? { mintContinuationTurnId: mint } : {}),
+    });
+    coordinator.onTerminal(state({ logicalTurnId, currentTurnId: logicalTurnId }), {
+      turnId: logicalTurnId,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+    scheduled[0]!();
+    return { enqueue, persist };
+  }
+
+  it('lets the daemon mint the continuation turn id and persists that exact identity before enqueue', () => {
+    const mint = vi.fn((logicalTurnId: string, continuation: number) => `schedule:abcdef12:cont-${continuation}`);
+    const { enqueue, persist } = drive(mint, 'schedule:abcdef12:11111111-1111-1111-1111-111111111111');
+
+    expect(mint).toHaveBeenCalledWith('schedule:abcdef12:11111111-1111-1111-1111-111111111111', 1);
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      logicalTurnId: 'schedule:abcdef12:11111111-1111-1111-1111-111111111111',
+      turnId: 'schedule:abcdef12:cont-1',
+      continuation: 1,
+    }));
+    const dispatching = persist.mock.calls.map(([value]) => value).find(value => value.status === 'dispatching');
+    expect(dispatching).toEqual(expect.objectContaining({ currentTurnId: 'schedule:abcdef12:cont-1' }));
+    expect(persist).toHaveBeenLastCalledWith(expect.objectContaining({
+      currentTurnId: 'schedule:abcdef12:cont-1',
+      status: 'running',
+    }));
+  });
+
+  it('keeps the default bmx-recovery id when the minter declines or is absent', () => {
+    expect(drive(() => undefined, 'om_original').enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ turnId: 'bmx-recovery-rand' }),
+    );
+    expect(drive(undefined, 'om_original').enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ turnId: 'bmx-recovery-rand' }),
+    );
+  });
+});

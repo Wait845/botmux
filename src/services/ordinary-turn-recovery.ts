@@ -46,6 +46,11 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   persist: (state: OrdinaryTurnRecoveryState) => void;
   enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => boolean;
   warn: (state: OrdinaryTurnRecoveryState) => void;
+  /** Identity for the next continuation of `logicalTurnId`. Return undefined
+   *  to keep the default `bmx-recovery-<random>` id. The daemon uses this to
+   *  keep a scheduled turn's `schedule:<taskId>:<uuid>` provenance on its
+   *  continuation, so the continuation authenticates exactly like the fire. */
+  mintContinuationTurnId?: (logicalTurnId: string, continuation: number) => string | undefined;
   now?: () => number;
   randomId?: () => string;
   backoffMs?: readonly number[];
@@ -207,7 +212,8 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       const live = this.state;
       if (!live || live.status !== 'backoff') return;
       const continuation = live.continuationsStarted + 1;
-      const turnId = `bmx-recovery-${this.randomId()}`;
+      const turnId = this.deps.mintContinuationTurnId?.(live.logicalTurnId, continuation)
+        ?? `bmx-recovery-${this.randomId()}`;
       // Persist the exact synthetic turn before handing it to IPC. If the
       // daemon crashes after this write, restore fails closed instead of
       // replaying a continuation whose external effects may already have
