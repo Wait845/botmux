@@ -24,6 +24,30 @@ export interface OrdinaryTurnRecoveryState {
   /** True once the one user-visible warning has been scheduled. */
   warningDispatched?: boolean;
   cancelledByTurnId?: string;
+  /** Type-ahead successors admitted while the owner was still running, in
+   *  admission order. Claude runs them after the owner, so ownership moves to
+   *  the head of this list when the owner completes; a terminal for one of them
+   *  while the owner is still `running` means the owner's terminal was lost and
+   *  the successor is adopted on the spot. Absent when empty. */
+  queuedLogicalTurnIds?: string[];
+}
+
+/** The slot is held by the original logical turn itself, still running — no
+ *  continuation has been dispatched for it. Only then may a queued successor's
+ *  terminal mean "the owner's terminal was lost" and be adopted. */
+function ownerAwaitingOwnTerminal(state: OrdinaryTurnRecoveryState): boolean {
+  return state.status === 'running' && state.currentTurnId === state.logicalTurnId;
+}
+
+/** Bound on remembered type-ahead successors; older ones are forgotten first. */
+const MAX_QUEUED_LOGICAL_TURNS = 32;
+
+function withQueuedLogicalTurnIds(
+  state: OrdinaryTurnRecoveryState,
+  queued: readonly string[],
+): OrdinaryTurnRecoveryState {
+  const { queuedLogicalTurnIds: _dropped, ...rest } = state;
+  return queued.length > 0 ? { ...rest, queuedLogicalTurnIds: [...queued] } : rest;
 }
 
 export interface OrdinaryTurnRecoveryTerminal {
@@ -100,7 +124,20 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     // entered backoff (or reached a terminal state), a fresh admitted user turn
     // may replace it as before.
     if (this.state?.status === 'running' || this.state?.status === 'dispatching') {
-      return this.state;
+      // Remember the successor without disturbing the live owner. A persist
+      // failure here degrades to the old behaviour (successor not tracked).
+      const live = this.state;
+      const queued = live.queuedLogicalTurnIds ?? [];
+      if (logicalTurnId === live.currentTurnId || logicalTurnId === live.logicalTurnId
+        || queued.includes(logicalTurnId)) return live;
+      try {
+        return this.commit(withQueuedLogicalTurnIds(
+          live,
+          [...queued, logicalTurnId].slice(-MAX_QUEUED_LOGICAL_TURNS),
+        ));
+      } catch {
+        return live;
+      }
     }
     const wasBackoff = this.state?.status === 'backoff';
     this.cancelTimer();
@@ -121,9 +158,44 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     current: OrdinaryTurnRecoveryState,
     terminal: OrdinaryTurnRecoveryTerminal,
   ): OrdinaryTurnRecoveryState {
-    if (terminal.turnId !== current.currentTurnId
-      || current.status !== 'running') return current;
-    if (terminal.status === 'completed') return this.commit({ ...current, status: 'completed' });
+    if (terminal.turnId !== current.currentTurnId) {
+      const queued = current.queuedLogicalTurnIds ?? [];
+      if (!queued.includes(terminal.turnId)) return current;
+      const remaining = withQueuedLogicalTurnIds(current, queued.filter(id => id !== terminal.turnId));
+      // The owner's own recovery is in flight (backoff timer, dispatching, or
+      // an already-delivered continuation that is still running) or the owner
+      // already settled: the successor ran on its own and is simply forgotten
+      // here — the delivered continuation keeps the slot.
+      if (!ownerAwaitingOwnTerminal(current)) return this.commit(remaining);
+      // The owner never reported a terminal (lost/missed) yet its successor
+      // did: the successor is the live turn now, and its terminal is handled
+      // exactly as an owner terminal would be.
+      const adopted = this.commit({
+        ...remaining,
+        logicalTurnId: terminal.turnId,
+        currentTurnId: terminal.turnId,
+        continuationsStarted: 0,
+        status: 'running',
+        nextAttemptAt: undefined,
+        lastErrorCode: undefined,
+        alertSentAt: undefined,
+        warningDispatched: undefined,
+      });
+      return this.onTerminal(adopted, terminal);
+    }
+    if (current.status !== 'running') return current;
+    if (terminal.status === 'completed') {
+      const [next, ...rest] = current.queuedLogicalTurnIds ?? [];
+      if (next === undefined) return this.commit({ ...current, status: 'completed' });
+      // Hand the slot to the type-ahead successor Claude is about to run, so
+      // its failure has a recovery consumer instead of only the fallback card.
+      return this.commit(withQueuedLogicalTurnIds({
+        logicalTurnId: next,
+        currentTurnId: next,
+        continuationsStarted: 0,
+        status: 'running',
+      }, rest));
+    }
     if (terminal.errorCode === 'provider_rate_limited') return current;
     if (terminal.status !== 'failed' || terminal.retryable !== true) {
       const next = {
@@ -387,8 +459,14 @@ export function ordinaryTurnRecoveryHandlesTerminal(
   terminal: OrdinaryTurnRecoveryTerminal,
 ): boolean {
   const current = session.ordinaryTurnRecovery;
-  return attachedRecoveries.get(session.sessionId)?.session === session
-    && current?.currentTurnId === terminal.turnId;
+  if (attachedRecoveries.get(session.sessionId)?.session !== session || !current) return false;
+  if (current.currentTurnId === terminal.turnId) return true;
+  // A queued type-ahead successor is adopted by onTerminal only while the
+  // original owner itself is still running (no continuation dispatched); in any
+  // other state its terminal is merely forgotten and the fallback notice must
+  // stay in charge.
+  return ownerAwaitingOwnTerminal(current)
+    && (current.queuedLogicalTurnIds ?? []).includes(terminal.turnId);
 }
 
 export function beginOrdinaryTurnRecovery(

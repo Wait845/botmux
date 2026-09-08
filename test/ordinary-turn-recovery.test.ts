@@ -5,6 +5,7 @@ import {
   cancelOrdinaryTurnRecoveryForUserInput,
   disposeOrdinaryTurnRecovery,
   handleOrdinaryTurnRecoveryTerminal,
+  ordinaryTurnRecoveryHandlesTerminal,
   requireOrdinaryTurnRecoveryAttention,
   ORDINARY_TURN_RECOVERY_PROMPT,
   OrdinaryTurnRecoveryCoordinator,
@@ -196,8 +197,177 @@ describe('OrdinaryTurnRecoveryCoordinator', () => {
 
     const current = coordinator.begin('om_type_ahead');
 
-    expect(current).toEqual(running);
-    expect(persist).not.toHaveBeenCalled();
+    // The running owner keeps the terminal; the successor is only remembered.
+    expect(current).toEqual({ ...running, queuedLogicalTurnIds: ['om_type_ahead'] });
+    expect(persist).toHaveBeenCalledWith({ ...running, queuedLogicalTurnIds: ['om_type_ahead'] });
+    expect(coordinator.begin('om_type_ahead')).toEqual(current);
+  });
+
+  it('hands ownership to the queued type-ahead turn once the running turn completes', () => {
+    const scheduled: Array<() => void> = [];
+    const enqueue = vi.fn(() => true);
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => { scheduled.push(run); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      now: () => 1_000,
+      randomId: () => 'one',
+      backoffMs: [2_000, 8_000],
+    });
+    coordinator.restore(state());
+    const queued = coordinator.begin('om_type_ahead');
+
+    const promoted = coordinator.onTerminal(queued, { turnId: 'om_original', status: 'completed' });
+    expect(promoted).toEqual({
+      logicalTurnId: 'om_type_ahead',
+      currentTurnId: 'om_type_ahead',
+      continuationsStarted: 0,
+      status: 'running',
+    });
+
+    // Before this, the successor's failure had no recovery consumer at all and
+    // fell through to the「未启动自动续跑」card.
+    const failed = coordinator.onTerminal(promoted, {
+      turnId: 'om_type_ahead', status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    expect(failed.status).toBe('backoff');
+    scheduled[0]!();
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      logicalTurnId: 'om_type_ahead',
+      turnId: 'bmx-recovery-one',
+      continuation: 1,
+    }));
+  });
+
+  it('adopts a queued successor whose terminal arrives while the owner terminal was lost', () => {
+    const schedule = vi.fn((_delayMs: number, run: () => void) => run);
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => true),
+      warn: vi.fn(),
+      now: () => 1_000,
+      randomId: () => 'one',
+      backoffMs: [2_000, 8_000],
+    });
+    coordinator.restore(state());
+    const queued = coordinator.begin('om_type_ahead');
+
+    const next = coordinator.onTerminal(queued, {
+      turnId: 'om_type_ahead', status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    expect(next).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_type_ahead',
+      currentTurnId: 'om_type_ahead',
+      status: 'backoff',
+    }));
+    expect(next.queuedLogicalTurnIds).toBeUndefined();
+    expect(schedule).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a delivered continuation as owner when the earlier-queued successor terminates first', () => {
+    const scheduled: Array<() => void> = [];
+    const enqueue = vi.fn(() => true);
+    const persist = vi.fn();
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => { scheduled.push(run); return run; },
+      cancel: vi.fn(),
+      persist,
+      enqueue,
+      warn: vi.fn(),
+      now: () => 1_000,
+      randomId: () => 'one',
+      backoffMs: [2_000, 8_000],
+    });
+    coordinator.restore(state());
+    const queued = coordinator.begin('om_type_ahead');
+    // A fails → backoff → A's continuation delivered and running.
+    coordinator.onTerminal(queued, {
+      turnId: 'om_original', status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    scheduled[0]!();
+    const inFlight = persist.mock.calls.at(-1)![0] as OrdinaryTurnRecoveryState;
+    expect(inFlight).toEqual(expect.objectContaining({
+      currentTurnId: 'bmx-recovery-one', continuationsStarted: 1, status: 'running',
+      queuedLogicalTurnIds: ['om_type_ahead'],
+    }));
+
+    // B was queued in Claude before the continuation, so it terminates first:
+    // it must not steal the slot from the delivered continuation, and its
+    // failure must not dispatch a second recovery.
+    const afterB = coordinator.onTerminal(inFlight, {
+      turnId: 'om_type_ahead', status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    expect(afterB).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_original', currentTurnId: 'bmx-recovery-one', continuationsStarted: 1, status: 'running',
+    }));
+    expect(afterB.queuedLogicalTurnIds).toBeUndefined();
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    expect(scheduled).toHaveLength(1);
+
+    // The continuation's own terminal still settles the original logical turn.
+    expect(coordinator.onTerminal(afterB, { turnId: 'bmx-recovery-one', status: 'completed' }))
+      .toEqual(expect.objectContaining({ logicalTurnId: 'om_original', status: 'completed' }));
+  });
+
+  it('does not let a queued successor completing first overwrite a running continuation', () => {
+    const scheduled: Array<() => void> = [];
+    const enqueue = vi.fn(() => true);
+    const persist = vi.fn();
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => { scheduled.push(run); return run; },
+      cancel: vi.fn(),
+      persist,
+      enqueue,
+      warn: vi.fn(),
+      now: () => 1_000,
+      randomId: () => 'one',
+      backoffMs: [2_000, 8_000],
+    });
+    coordinator.restore(state());
+    const queued = coordinator.begin('om_type_ahead');
+    coordinator.onTerminal(queued, {
+      turnId: 'om_original', status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    scheduled[0]!();
+    const inFlight = persist.mock.calls.at(-1)![0] as OrdinaryTurnRecoveryState;
+
+    // B completes before A_recovery: A_recovery must stay the running owner ...
+    const afterB = coordinator.onTerminal(inFlight, { turnId: 'om_type_ahead', status: 'completed' });
+    expect(afterB).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_original', currentTurnId: 'bmx-recovery-one', continuationsStarted: 1, status: 'running',
+    }));
+    expect(afterB.queuedLogicalTurnIds).toBeUndefined();
+    // ... so its later retryable failure still drives the second (bounded) continuation.
+    const afterRecoveryFailed = coordinator.onTerminal(afterB, {
+      turnId: 'bmx-recovery-one', status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    expect(afterRecoveryFailed.status).toBe('backoff');
+    expect(scheduled).toHaveLength(2);
+  });
+
+  it('only forgets a queued successor that terminates while a recovery is already in flight', () => {
+    const schedule = vi.fn((_delayMs: number, run: () => void) => run);
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => true),
+      warn: vi.fn(),
+      now: () => 1_000,
+      randomId: () => 'one',
+      backoffMs: [2_000, 8_000],
+    });
+    const backoff = state({ status: 'backoff', nextAttemptAt: 3_000, queuedLogicalTurnIds: ['om_type_ahead'] });
+    coordinator.restore(backoff);
+
+    const after = coordinator.onTerminal(backoff, { turnId: 'om_type_ahead', status: 'completed' });
+    expect(after).toEqual(expect.objectContaining({ currentTurnId: 'om_original', status: 'backoff' }));
+    expect(after.queuedLogicalTurnIds).toBeUndefined();
+    expect(coordinator.onTerminal(after, { turnId: 'om_unknown', status: 'completed' })).toEqual(after);
   });
 
   it('ignores stale, duplicate, non-retryable, and rate-limited terminals', () => {
@@ -229,6 +399,29 @@ describe('OrdinaryTurnRecoveryCoordinator', () => {
 });
 
 describe('ordinary recovery session registry', () => {
+  it('claims a terminal for a queued type-ahead successor so the fallback card stays quiet', () => {
+    const session = { sessionId: 'session-queued', ordinaryTurnRecovery: state() } as any;
+    attachOrdinaryTurnRecovery(session, {
+      schedule: (_delay, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => true),
+      warn: vi.fn(),
+    });
+    beginOrdinaryTurnRecovery(session, 'om_type_ahead');
+
+    expect(ordinaryTurnRecoveryHandlesTerminal(session, { turnId: 'om_original', status: 'completed' })).toBe(true);
+    expect(ordinaryTurnRecoveryHandlesTerminal(session, { turnId: 'om_type_ahead', status: 'failed' })).toBe(true);
+    expect(ordinaryTurnRecoveryHandlesTerminal(session, { turnId: 'om_unknown', status: 'failed' })).toBe(false);
+
+    // Once a continuation holds the slot, the queued successor is no longer claimed.
+    session.ordinaryTurnRecovery = state({
+      currentTurnId: 'bmx-recovery-live', continuationsStarted: 1, queuedLogicalTurnIds: ['om_type_ahead'],
+    });
+    expect(ordinaryTurnRecoveryHandlesTerminal(session, { turnId: 'bmx-recovery-live', status: 'failed' })).toBe(true);
+    expect(ordinaryTurnRecoveryHandlesTerminal(session, { turnId: 'om_type_ahead', status: 'failed' })).toBe(false);
+  });
+
   it('begins a fresh logical turn only after its daemon admission succeeds', () => {
     const session = { sessionId: 'session-begin' } as any;
     attachOrdinaryTurnRecovery(session, {
