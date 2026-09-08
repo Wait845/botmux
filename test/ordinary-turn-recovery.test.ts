@@ -6,6 +6,7 @@ import {
   disposeOrdinaryTurnRecovery,
   handleOrdinaryTurnRecoveryTerminal,
   ordinaryTurnRecoveryHandlesTerminal,
+  ordinaryTurnRecoverySilentTurnIds,
   requireOrdinaryTurnRecoveryAttention,
   ORDINARY_TURN_RECOVERY_PROMPT,
   OrdinaryTurnRecoveryCoordinator,
@@ -711,5 +712,123 @@ describe('continuation identity', () => {
     expect(drive(undefined, 'om_original').enqueue).toHaveBeenCalledWith(
       expect.objectContaining({ turnId: 'bmx-recovery-rand' }),
     );
+  });
+});
+
+describe('silent scheduled turns keep their silence across continuations', () => {
+  const SILENT = 'schedule:abcdef12:11111111-1111-1111-1111-111111111111';
+
+  function coordinatorWith(enqueue = vi.fn(() => true)) {
+    const scheduled: Array<() => void> = [];
+    let seq = 0;
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => { scheduled.push(run); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      now: () => 1_000,
+      randomId: () => `r${++seq}`,
+      backoffMs: [2_000, 8_000],
+    });
+    const fail = (current: OrdinaryTurnRecoveryState, turnId: string) => coordinator.onTerminal(current, {
+      turnId, status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    const fire = () => { scheduled.shift()!(); };
+    return { coordinator, enqueue, fail, fire };
+  }
+
+  it('freezes the silent attribute at admission and carries it onto every continuation', () => {
+    const { coordinator, enqueue, fail, fire } = coordinatorWith();
+    const running = coordinator.begin(SILENT, { silent: true });
+    expect(running.silentLogicalTurnIds).toEqual([SILENT]);
+
+    fail(running, SILENT); fire();
+    expect(enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ logicalTurnId: SILENT, continuation: 1, silent: true }));
+    const first = enqueue.mock.calls[0]![0] as any;
+    fail({ ...running, currentTurnId: first.turnId, continuationsStarted: 1, status: 'running', silentLogicalTurnIds: [SILENT] }, first.turnId); fire();
+    expect(enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ continuation: 2, silent: true }));
+  });
+
+  it('keeps silence per logical turn: a queued silent successor is silent after promotion, an ordinary successor is not', () => {
+    const { coordinator, enqueue, fail, fire } = coordinatorWith();
+    const owner = coordinator.begin('om_first');
+    const withSilent = coordinator.begin(SILENT, { silent: true });
+    expect(withSilent.queuedLogicalTurnIds).toEqual([SILENT]);
+    expect(withSilent.silentLogicalTurnIds).toEqual([SILENT]);
+    const withOm = coordinator.begin('om_second');
+    expect(withOm.queuedLogicalTurnIds).toEqual([SILENT, 'om_second']);
+
+    // The loud owner's own continuation stays loud.
+    const backoff = fail(withOm, 'om_first'); fire();
+    expect(enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ logicalTurnId: 'om_first', silent: false }));
+    const cont = (enqueue.mock.calls.at(-1)![0] as any).turnId;
+    const promotedSilent = coordinator.onTerminal(
+      { ...backoff, currentTurnId: cont, continuationsStarted: 1, status: 'running' },
+      { turnId: cont, status: 'completed' },
+    );
+    expect(promotedSilent).toEqual(expect.objectContaining({ logicalTurnId: SILENT, currentTurnId: SILENT, status: 'running' }));
+    expect(promotedSilent.silentLogicalTurnIds).toEqual([SILENT]);
+    expect(promotedSilent.queuedLogicalTurnIds).toEqual(['om_second']);
+
+    fail(promotedSilent, SILENT); fire();
+    expect(enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ logicalTurnId: SILENT, silent: true }));
+    const silentCont = (enqueue.mock.calls.at(-1)![0] as any).turnId;
+    const promotedOm = coordinator.onTerminal(
+      { ...promotedSilent, currentTurnId: silentCont, continuationsStarted: 1, status: 'running' },
+      { turnId: silentCont, status: 'completed' },
+    );
+    expect(promotedOm).toEqual(expect.objectContaining({ logicalTurnId: 'om_second', status: 'running' }));
+    expect(promotedOm.silentLogicalTurnIds).toBeUndefined();
+    fail(promotedOm, 'om_second'); fire();
+    expect(enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ logicalTurnId: 'om_second', silent: false }));
+    expect(owner.silentLogicalTurnIds).toBeUndefined();
+  });
+
+  it('keeps silence when a queued silent successor is adopted after the owner terminal was lost', () => {
+    const { coordinator, enqueue, fail, fire } = coordinatorWith();
+    coordinator.begin('om_first');
+    const queued = coordinator.begin(SILENT, { silent: true });
+    const adopted = fail(queued, SILENT);
+    expect(adopted).toEqual(expect.objectContaining({ logicalTurnId: SILENT, status: 'backoff', silentLogicalTurnIds: [SILENT] }));
+    fire();
+    expect(enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ logicalTurnId: SILENT, silent: true }));
+  });
+
+  it('does not inherit silence into a fresh turn after cancellation, and tolerates archives without the field', () => {
+    const { coordinator, enqueue, fail, fire } = coordinatorWith();
+    const silent = coordinator.begin(SILENT, { silent: true });
+    fail(silent, SILENT);
+    coordinator.cancelForUserInput('om_next');
+    const fresh = coordinator.begin('om_next');
+    expect(fresh.silentLogicalTurnIds).toBeUndefined();
+    fail(fresh, 'om_next'); fire();
+    expect(enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ logicalTurnId: 'om_next', silent: false }));
+
+    const legacy = coordinatorWith();
+    legacy.coordinator.restore({ logicalTurnId: SILENT, currentTurnId: SILENT, continuationsStarted: 0, status: 'backoff', nextAttemptAt: 0 });
+    legacy.fire();
+    expect(legacy.enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ logicalTurnId: SILENT, silent: false }));
+  });
+
+  it('lists the turn ids a restore must re-arm as silent', () => {
+    expect(ordinaryTurnRecoverySilentTurnIds(undefined)).toEqual([]);
+    expect(ordinaryTurnRecoverySilentTurnIds(state())).toEqual([]);
+    // Owner silent, its delivered continuation running: both ids.
+    expect(ordinaryTurnRecoverySilentTurnIds(state({
+      logicalTurnId: SILENT, currentTurnId: 'schedule:abcdef12:22222222-2222-2222-2222-222222222222',
+      continuationsStarted: 1, silentLogicalTurnIds: [SILENT],
+    }))).toEqual([SILENT, 'schedule:abcdef12:22222222-2222-2222-2222-222222222222']);
+    // Loud owner with a silent queued successor: only the successor.
+    expect(ordinaryTurnRecoverySilentTurnIds(state({
+      queuedLogicalTurnIds: [SILENT], silentLogicalTurnIds: [SILENT],
+    }))).toEqual([SILENT]);
+    // Settled states still re-arm: late idle/final events after a restart must
+    // stay hushed, and marks are turn-exact so this cannot leak onto other turns.
+    expect(ordinaryTurnRecoverySilentTurnIds(state({
+      logicalTurnId: SILENT, currentTurnId: 'schedule:abcdef12:22222222-2222-2222-2222-222222222222',
+      continuationsStarted: 1, status: 'completed', silentLogicalTurnIds: [SILENT],
+    }))).toEqual([SILENT, 'schedule:abcdef12:22222222-2222-2222-2222-222222222222']);
+    expect(ordinaryTurnRecoverySilentTurnIds(state({ status: 'cancelled' }))).toEqual([]);
   });
 });

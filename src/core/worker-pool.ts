@@ -473,6 +473,7 @@ import { publishAttentionPatch, publishClosedSessionPatch } from './session-acti
 import {
   attachOrdinaryTurnRecovery,
   beginOrdinaryTurnRecovery,
+  ordinaryTurnRecoverySilentTurnIds,
   cancelOrdinaryTurnRecoveryForUserInput as cancelOrdinaryRecoveryForUserInput,
   disposeOrdinaryTurnRecovery,
   handleOrdinaryTurnRecoveryTerminal,
@@ -1482,6 +1483,13 @@ export function ensureOrdinaryTurnRecoveryAttached(
     disposeOrdinaryTurnRecovery(ds.session);
     return false;
   }
+  // Re-arm the runtime silent registry from the persisted recovery state BEFORE
+  // the timer is re-armed: an overdue backoff fires on the next tick, and the
+  // enqueue below (plus every terminal-time suppression gate) reads that
+  // registry by exact turn id. Idempotent, so repeated attach calls are fine.
+  for (const turnId of ordinaryTurnRecoverySilentTurnIds(ds.session.ordinaryTurnRecovery)) {
+    if (!isSilentScheduledTurn(ds, turnId)) armSilentScheduledTurn(ds, turnId);
+  }
   attachOrdinaryTurnRecovery(ds.session, {
     schedule: (delayMs, run) => {
       const timer = setTimeout(run, delayMs);
@@ -1502,7 +1510,9 @@ export function ensureOrdinaryTurnRecoveryAttached(
       const trustedCaller = scheduledTaskId
         ? scheduledContinuationTrustedCaller(ds, scheduledTaskId)
         : undefined;
-      const silent = scheduledTaskId !== null && isSilentScheduledTurn(ds, dispatch.logicalTurnId);
+      // Silence comes from the frozen per-turn attribute in the persisted
+      // state, not from the runtime registry (which a daemon restart empties).
+      const silent = dispatch.silent;
       if (silent) armSilentScheduledTurn(ds, dispatch.turnId);
       let enqueued = false;
       try {
@@ -9339,7 +9349,12 @@ function recordAdmittedOrdinaryUserTurn(
   let recoveryBookkeepingSucceeded = false;
   try {
     if (opts.beginRecovery) {
-      const state = beginOrdinaryTurnRecovery(ds.session, turnId);
+      // Freeze the fire's silent attribute onto the logical turn now: the
+      // scheduler arms the runtime registry before dispatch, so it is readable
+      // here, and only the persisted copy survives a restart.
+      const state = beginOrdinaryTurnRecovery(ds.session, turnId, {
+        silent: isSilentScheduledTurn(ds, turnId),
+      });
       recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
         && state.currentTurnId === turnId;
     } else {
