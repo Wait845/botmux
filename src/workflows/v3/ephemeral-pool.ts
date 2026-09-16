@@ -546,13 +546,6 @@ export const spawnWorkerFactory: WorkerProcessFactory = {
 };
 
 /**
- * The dist directory whose `worker.js` the Node path forks. `spawnWorker`
- * resolves the actual entry: `<distDir>/worker.js` under Node, or the hidden
- * `__worker` subcommand of the running binary when standalone (where no
- * `worker.js` exists on disk and this path is ignored). `deps.workerPath` stays
- * injectable for tests.
- */
-/**
  * Terminal backend for a v3 ephemeral worker.
  *
  * Previously hardcoded to `'pty'`, which forced every workflow worker onto
@@ -572,6 +565,13 @@ export function v3WorkerBackendType(daemonBackend: BackendType = config.daemon.b
   return daemonBackend === 'tmux' ? 'tmux' : 'pty';
 }
 
+/**
+ * The dist directory whose `worker.js` the Node path forks. `spawnWorker`
+ * resolves the actual entry: `<distDir>/worker.js` under Node, or the hidden
+ * `__worker` subcommand of the running binary when standalone (where no
+ * `worker.js` exists on disk and this path is ignored). `deps.workerPath` stays
+ * injectable for tests.
+ */
 function defaultWorkerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   // src/workflows/v3 → dist root (matches worker-pool.ts `join(__dirname, '..')`).

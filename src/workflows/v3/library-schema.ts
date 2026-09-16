@@ -414,7 +414,15 @@ export function validateDagTemplate(raw: unknown): V3DagTemplate {
   const botProblems: string[] = [];
   validateDirectBotSelectors(nodes, undefined, 'dagTemplate.nodes', botProblems);
   if (botProblems.length > 0) throw new SavedWorkflowSchemaError(botProblems);
-  // Read-path deserialization must not retroactively reject pre-lint revisions; exact save confirms warnings separately.
+  // NOTE: the chat-facing side-effect policy lint is deliberately NOT run here.
+  // validateDagTemplate is the structural deserializer shared by the READ path
+  // (loadSavedWorkflowRevision → validateSavedWorkflowRevisionPayload), so
+  // gating it would retroactively brick already-saved revisions that were legal
+  // before the lint existed. The policy check runs only at authoring boundaries:
+  // validateSavedWorkflowRevisionDraft and v2 migration throw via
+  // assertNoSavedWorkflowChatSideEffects, while exact save
+  // (buildSavedWorkflowRevisionBaseline) surfaces the same findings as
+  // lintWarnings for an explicit --ack-unsafe acknowledgement.
   return {
     ...(raw.schemaVersion !== undefined ? { schemaVersion: raw.schemaVersion as 1 | 2 } : {}),
     nodes,
@@ -576,7 +584,20 @@ export function formatSavedWorkflowChatSideEffectProblems(
     `${problem.path} contains chat-facing side effect (${problem.kind}); ${problem.guidance}`);
 }
 
-// Draft validation and migration stay strict; exact save exposes lint for acknowledgement.
+/**
+ * Authoring-boundary policy gate. Throw when a to-be-saved DAG template has a
+ * chat-facing side effect in a goal node. This is intentionally NOT part of the
+ * structural deserializer (validateDagTemplate) or the read path
+ * (validateSavedWorkflowRevisionPayload): those are traversed when LOADING an
+ * already-saved revision, and gating them would retroactively brick revisions
+ * that were legal before the lint existed. Callers on the write/compile/publish
+ * side (validateSavedWorkflowRevisionDraft, v2→v3 migration) invoke this so a
+ * fresh authored definition must be lint-clean, while old revisions stay
+ * loadable/show-able/appendable (and can be fixed by appending a clean
+ * revision). Exact save (buildSavedWorkflowRevisionBaseline) does not throw:
+ * it reports the same findings as lintWarnings so the user can acknowledge
+ * them explicitly with --ack-unsafe.
+ */
 export function assertNoSavedWorkflowChatSideEffects(dagTemplate: V3DagTemplate): void {
   const chatEffects = formatSavedWorkflowChatSideEffectProblems(
     collectSavedWorkflowChatSideEffectProblems(dagTemplate),
