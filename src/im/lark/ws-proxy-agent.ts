@@ -46,7 +46,19 @@ function openApiHttpsUrl(openApiDomain: string): string {
 }
 
 /** Decide, from the process environment, how the ws long connection should
- *  reach `openApiDomain`. Pure apart from reading `process.env`. */
+ *  reach `openApiDomain`. Pure apart from reading `process.env`.
+ *
+ *  DELIBERATE BEHAVIOUR CHANGE vs the pre-fix per-connection `ProxyAgent`:
+ *  the SDK does not dial `openApiDomain` for the socket — it first POSTs
+ *  `/callback/ws/endpoint` and connects to the dynamic frontier host it returns
+ *  (e.g. `wss://msg-frontier.feishu.cn/ws/v2?…`). The old agent re-evaluated
+ *  `getProxyForUrl` at `connect()` time against that real host; a static
+ *  `HttpsProxyAgent` cannot, so both the proxy choice and the `no_proxy`
+ *  decision are made once here against the Open API domain instead. A `no_proxy`
+ *  suffix such as `.feishu.cn` covers both hosts and behaves identically; only
+ *  an exact-host `no_proxy` differs (`open.feishu.cn` now goes direct;
+ *  `msg-frontier.feishu.cn` no longer does). Standard suffix configs — the ones
+ *  real deployments use — are unaffected. */
 export function resolveLarkWsProxy(openApiDomain: string): LarkWsProxyResolution {
   const proxyUrl = getProxyForUrl(openApiHttpsUrl(openApiDomain));
   if (!proxyUrl) return { kind: 'direct' };

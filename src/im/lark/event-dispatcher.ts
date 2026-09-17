@@ -3502,7 +3502,6 @@ async function processCommentEvent(
   if (deliveryError) throw deliveryError;
 }
 
-
 /**
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
