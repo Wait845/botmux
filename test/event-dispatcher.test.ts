@@ -49,6 +49,14 @@ vi.mock('../src/utils/atomic-write.js', () => ({
   atomicWriteFileSync: (...args: any[]) => mockWriteFileSync(...args),
 }));
 
+// chat.bot_added 观察钩子的发射断言口。真实现是 fire-and-forget 且无 hooks 配置时
+// 为 no-op；mock 掉让断言直接看发射参数（client.ts 的 emitHookEvent 引用也走这个
+// mock，本文件不覆盖其行为）。
+const { emitHookEventMock } = vi.hoisted(() => ({ emitHookEventMock: vi.fn() }));
+vi.mock('../src/services/hook-runner.js', () => ({
+  emitHookEvent: (...args: unknown[]) => emitHookEventMock(...args),
+}));
+
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
 const mockGetBotOpenId = vi.fn((larkAppId: string) => mockGetBot(larkAppId)?.botOpenId as string | undefined);
@@ -9158,5 +9166,48 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
       scope: 'chat',
       anchor: 'chat-cmd',
     }));
+  });
+});
+
+describe('chat.bot_added observer hook', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    emitHookEventMock.mockClear();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    markForwardFollowupsSessionsReady(MY_APP_ID);
+  });
+
+  // 拉群信号钩子（应急群自动化的触发点）：bot 被拉进群即发射，早于 owner 自动邀请
+  // 与 autoStart 判定；payload 只带 chatId + operatorOpenId，去重由 scheduleAckSafeEvent
+  // 的 event claim 保证（重推不重复发射）。
+  it('fires once when the bot is added to a chat', async () => {
+    const event = {
+      chat_id: 'chat-emergency-1',
+      operator_id: { open_id: USER_OPEN_ID },
+    };
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+
+    const calls = emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added');
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toMatchObject({
+      larkAppId: MY_APP_ID,
+      chatId: 'chat-emergency-1',
+      operatorOpenId: USER_OPEN_ID,
+    });
+
+    // 同一事件重推（同 event claim key）不再发射。
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+    expect(emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added')).toHaveLength(1);
   });
 });

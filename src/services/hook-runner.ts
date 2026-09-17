@@ -10,6 +10,7 @@ import { readManagedOriginCapability } from '../core/managed-origin-capability.j
 import { loopbackFetch } from '../core/loopback-fetch.js';
 
 export const HOOK_EVENTS = [
+  'chat.bot_added',
   'topic.new',
   'thread.reply',
   'prompt.submit',
