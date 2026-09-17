@@ -287,6 +287,8 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同�
 | `autoStartOnGroupJoin` | `true` 时，被拉入含至少一名 `allowedUsers` 的新群即自动开工（不必 @）。需在飞书后台为该应用订阅 `im.chat.member.bot.added_v1` 事件 |
 | `autoStartOnGroupJoinPrompt` | 配合上面：自动开工的首轮 prompt；留空 / 空白则空消息开场，让 bot 自己读群上下文。`autoStartOnGroupJoin` 关闭时无意义 |
 | `autoStartOnNewTopic` | `true` 时，话题群里每个新话题的首条消息无需 @ 也自动开工（普通群无效）。默认被动（仅 @ 触发） |
+| `groupJoinCommandEnabled` | `true` 且 `groupJoinCommand` 非空时，被拉进**任意**群就直接在本机执行该命令，不起会话、不经模型；与 `autoStartOnGroupJoin` 相互独立（不要求群里有 `allowedUsers`）。同样需要订阅 `im.chat.member.bot.added_v1`。Dashboard「Bot 默认设置 → 主动开工」可编辑 |
+| `groupJoinCommand` | 入群执行的命令。执行方式同 [Hooks](./hooks.md)：不经 shell（管道/重定向写成 `bash -c '…'`）、最小环境变量（不含应用密钥）；stdin 是 JSON `{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`，另有 `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID` 环境变量；10 分钟超时杀进程组 |
 
 ## 群消息监听
 

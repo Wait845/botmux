@@ -19,7 +19,7 @@ import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
-import { emitHookEvent } from '../../services/hook-runner.js';
+import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
@@ -4665,6 +4665,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           emitHookEvent('chat.bot_added', { larkAppId, chatId, operatorOpenId });
         } catch (err) {
           logger.debug(`[hooks:${larkAppId}] chat.bot_added emit failed: ${err}`);
+        }
+        // 主动开工 — 入群执行命令（bots.json groupJoinCommand，不经 CLI/LLM）。
+        // 不受 autoStartOnGroupJoin / allowedUser 在群闸约束，两者独立。
+        try {
+          const joinCfg = getBot(larkAppId).config;
+          const joinCommand = joinCfg.groupJoinCommand?.trim();
+          if (joinCfg.groupJoinCommandEnabled === true && joinCommand) {
+            runGroupJoinCommand(joinCommand, { larkAppId, chatId, operatorOpenId });
+          }
+        } catch (err) {
+          logger.warn(`[group-join-command:${larkAppId}] skipped: ${err}`);
         }
         // 进群先自动拉 owner（不受任何开工开关影响，失败仅日志）：bot 应始终
         // 处于 owner 可见的群里。放在 handleBotAdded 之前，让 autoStart 的

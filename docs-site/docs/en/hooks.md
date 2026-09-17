@@ -66,7 +66,7 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 
 | Event | Trigger |
 |------|----------|
-| `chat.bot_added` | The bot was added to a chat (requires subscribing `im.chat.member.bot.added_v1` in the Feishu console). Payload: `chatId`, `operatorOpenId` |
+| `chat.bot_added` | The bot was added to a chat (requires subscribing `im.chat.member.bot.added_v1` in the Feishu console). Payload: `chatId`, `operatorOpenId`. For a per-bot join script you can also use `groupJoinCommand` in bots.json (editable under Auto-start in the Dashboard) |
 | `topic.new` | A new topic / @mention is received |
 | `thread.reply` | A reply to an existing topic is received |
 | `prompt.submit` | A message passed the built-in permission checks and is **about to be submitted to the CLI**. Usable as a plain notification (default `async`), and the only event that supports `mode:"sync"` blocking |

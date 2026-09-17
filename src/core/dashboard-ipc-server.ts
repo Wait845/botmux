@@ -22,6 +22,7 @@ import {
 import * as sessionStore from '../services/session-store.js';
 import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
+import { parseHookCommand } from '../services/hook-runner.js';
 import {
   cliModelSupportsReasoningEffort,
   isBackendVariantCliId,
@@ -5665,6 +5666,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // 当前生效的内置默认 seed 文案（按 bot locale），供前端 placeholder 展示。
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
+    groupJoinCommandEnabled: cardPrefs.groupJoinCommandEnabled,
+    groupJoinCommand: cardPrefs.groupJoinCommand,
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
     quotaFallbackBot: (() => {
@@ -5784,6 +5787,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     thinkingCardToolResult?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
+    groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
@@ -5798,6 +5802,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     thinkingCardToolResult?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
+    groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
@@ -5851,6 +5856,16 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     patch.autoStartOnGroupJoinSeed = looksDefault ? '' : seed;
   }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
+  if (typeof body.groupJoinCommandEnabled === 'boolean') patch.groupJoinCommandEnabled = body.groupJoinCommandEnabled;
+  if (typeof body.groupJoinCommand === 'string') {
+    // 解析不了的命令（未闭合引号）当场拒绝——否则保存成功、入群时才静默跑不起来。
+    try {
+      if (body.groupJoinCommand.trim()) parseHookCommand(body.groupJoinCommand);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_group_join_command' });
+    }
+    patch.groupJoinCommand = body.groupJoinCommand;
+  }
   if (typeof body.regularGroupReplyMode === 'string') {
     const m = normalizeChatReplyMode(body.regularGroupReplyMode);
     if (m) patch.regularGroupReplyMode = m;

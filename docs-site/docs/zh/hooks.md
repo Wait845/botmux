@@ -66,7 +66,7 @@ tail -f /tmp/botmux-hook.log
 
 | 事件 | 触发时机 |
 |------|----------|
-| `chat.bot_added` | bot 被拉进一个群（需在飞书后台订阅 `im.chat.member.bot.added_v1`）。payload：`chatId`、`operatorOpenId` |
+| `chat.bot_added` | bot 被拉进一个群（需在飞书后台订阅 `im.chat.member.bot.added_v1`）。payload：`chatId`、`operatorOpenId`。只想给某个 bot 配入群脚本时，也可以用 bots.json 的 `groupJoinCommand`（Dashboard 主动开工里可编辑） |
 | `topic.new` | 收到新话题 / @mention |
 | `thread.reply` | 收到已有话题回复 |
 | `prompt.submit` | 消息通过内置权限校验、**即将提交给 CLI 之前**。既可当普通通知（默认 `async`），也是唯一支持 `mode:"sync"` 前置拦截的事件 |

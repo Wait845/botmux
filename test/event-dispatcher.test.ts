@@ -52,9 +52,10 @@ vi.mock('../src/utils/atomic-write.js', () => ({
 // chat.bot_added 观察钩子的发射断言口。真实现是 fire-and-forget 且无 hooks 配置时
 // 为 no-op；mock 掉让断言直接看发射参数（client.ts 的 emitHookEvent 引用也走这个
 // mock，本文件不覆盖其行为）。
-const { emitHookEventMock } = vi.hoisted(() => ({ emitHookEventMock: vi.fn() }));
+const { emitHookEventMock, runGroupJoinCommandMock } = vi.hoisted(() => ({ emitHookEventMock: vi.fn(), runGroupJoinCommandMock: vi.fn() }));
 vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: (...args: unknown[]) => emitHookEventMock(...args),
+  runGroupJoinCommand: (...args: unknown[]) => runGroupJoinCommandMock(...args),
 }));
 
 const mockGetBot = vi.fn();
@@ -9209,5 +9210,34 @@ describe('chat.bot_added observer hook', () => {
     capturedHandlers['im.chat.member.bot.added_v1'](event);
     await flushEventWork();
     expect(emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added')).toHaveLength(1);
+  });
+
+  it('runs the per-bot group-join command once when enabled, independent of autoStart', async () => {
+    runGroupJoinCommandMock.mockClear();
+    const state = setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    Object.assign(state.config, { groupJoinCommandEnabled: true, groupJoinCommand: ' bash /opt/on-join.sh ' });
+    const event = { chat_id: 'chat-emergency-2', operator_id: { open_id: USER_OPEN_ID } };
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+    expect(runGroupJoinCommandMock).toHaveBeenCalledTimes(1);
+    expect(runGroupJoinCommandMock).toHaveBeenCalledWith('bash /opt/on-join.sh', {
+      larkAppId: MY_APP_ID, chatId: 'chat-emergency-2', operatorOpenId: USER_OPEN_ID,
+    });
+
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+    expect(runGroupJoinCommandMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run the group-join command when disabled or blank', async () => {
+    runGroupJoinCommandMock.mockClear();
+    const state = setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    Object.assign(state.config, { groupJoinCommandEnabled: false, groupJoinCommand: 'bash /opt/on-join.sh' });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-off', operator_id: { open_id: USER_OPEN_ID } });
+    await flushEventWork();
+    Object.assign(state.config, { groupJoinCommandEnabled: true, groupJoinCommand: '   ' });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-blank', operator_id: { open_id: USER_OPEN_ID } });
+    await flushEventWork();
+    expect(runGroupJoinCommandMock).not.toHaveBeenCalled();
   });
 });

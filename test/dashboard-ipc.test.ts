@@ -1953,6 +1953,45 @@ describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — 入群执行命令', () => {
+  it('persists toggle + command, rejects an unparsable command', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-join-cmd-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-join-cmd-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    let handle: Awaited<ReturnType<typeof startIpcServer>> | null = null;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (body: unknown) => fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+
+      const ok = await put({ groupJoinCommand: 'bash /opt/on-join.sh', groupJoinCommandEnabled: true });
+      expect(ok.status).toBe(200);
+      expect(await ok.json()).toMatchObject({ ok: true, groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh' });
+
+      const get = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(get).toMatchObject({ groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh' });
+
+      const bad = await put({ groupJoinCommand: 'bash "unterminated' });
+      expect(bad.status).toBe(400);
+      expect(await bad.json()).toMatchObject({ ok: false, error: 'invalid_group_join_command' });
+      expect(getBot(appId).config.groupJoinCommand).toBe('bash /opt/on-join.sh');
+    } finally {
+      if (handle) await handle.close();
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — 入群 seed 文案与内置默认一致时不落盘', () => {
   // 编辑态软预填把「当前生效的内置默认」直接填进输入框，所以一次顺手的保存会把
   // bot 从「跟随动态默认」钉死成「锁定这一版文案」（升级不再跟上、切 locale 仍发

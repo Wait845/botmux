@@ -2018,6 +2018,20 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinSeed?: string;
   /**
+   * 主动开工 — 入群执行命令开关。true 且 {@link groupJoinCommand} 非空时，bot 被拉进
+   * 任意群就直接执行该命令（不起 CLI 会话、不经 LLM），与 {@link autoStartOnGroupJoin}
+   * 互相独立、可同时开。不做 allowedUser 在群闸：命令本身由 bot 管理员配置，
+   * 典型场景是告警平台拉的应急群里人还没进来就要先跑诊断脚本。
+   */
+  groupJoinCommandEnabled?: boolean;
+  /**
+   * 主动开工 — 入群执行的命令。执行契约同 hooks.json（无 shell、按空白/引号切分参数、
+   * 最小 env 白名单）；stdin 是 JSON `{event:'chat.bot_added', larkAppId, chatId,
+   * operatorOpenId, emittedAt}`，另有 BOTMUX_JOIN_CHAT_ID / BOTMUX_JOIN_LARK_APP_ID /
+   * BOTMUX_JOIN_OPERATOR_OPEN_ID 环境变量；超时 10 分钟杀进程组。
+   */
+  groupJoinCommand?: string;
+  /**
    * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
    * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
    *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
@@ -3725,6 +3739,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
+      groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()
+        ? entry.groupJoinCommand.trim()
+        : undefined,
       // 默认 OFF：只有显式 true 有意义/落盘。开启后 `botmux send --mention`
       // 才能用完整邮箱/手机号等标识 @ 群内任意成员（见 BotConfig 上的说明）。
       allowArbitraryMention: entry.allowArbitraryMention === true || undefined,
