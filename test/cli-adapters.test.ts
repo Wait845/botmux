@@ -258,8 +258,37 @@ describe('claude-code buildArgs', () => {
     for (const prompt of [systemPrompt, shellHints]) {
       expect(prompt).toContain('--response-kind final');
       expect(prompt).toContain('feedback buttons');
-      expect(prompt).toContain('--as independent');
-      expect(prompt).toContain('--as suggestion');
+    }
+  });
+
+  // 同一条对齐守卫，但针对受实验开关控制的 `--as` 提示：两条注入路径必须同时
+  // 出现、同时消失。只断言「开启时都有」会漏掉「关闭时只有一条路径漏了」，
+  // 所以两个方向都断言。开关默认关闭，见 isCrossPrincipalInterruptionEnabled。
+  it('keeps the cross-principal --as hint aligned across both injection paths, in both switch states', () => {
+    const originalXpi = process.env.BOTMUX_XPI_ENABLED;
+    try {
+      process.env.BOTMUX_XPI_ENABLED = 'true';
+      for (const prompt of [
+        buildBotmuxSystemPromptText({ locale: 'en' }),
+        buildBotmuxShellHints('en').join('\n'),
+      ]) {
+        expect(prompt).toContain('--as independent');
+        expect(prompt).toContain('--as suggestion');
+      }
+
+      process.env.BOTMUX_XPI_ENABLED = 'false';
+      for (const prompt of [
+        buildBotmuxSystemPromptText({ locale: 'en' }),
+        buildBotmuxShellHints('en').join('\n'),
+      ]) {
+        expect(prompt).not.toContain('--as independent');
+        expect(prompt).not.toContain('--as suggestion');
+        // 闸是外科式的：其余路由提示不受影响。
+        expect(prompt).toContain('--response-kind final');
+      }
+    } finally {
+      if (originalXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = originalXpi;
     }
   });
 
@@ -531,6 +560,32 @@ describe('codex buildArgs', () => {
       '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
       '-c', 'check_for_update_on_startup=false', 'thread-xyz',
     ]);
+  });
+
+  it('traex native fork branches the source session instead of resuming it', () => {
+    const traex = createTraexAdapter('/bin/traecli');
+    const args = traex.buildArgs({
+      sessionId: 'botmux-child',
+      resume: true,
+      resumeSessionId: 'traex-parent',
+      forkSession: true,
+      workingDir: '/workspace',
+    });
+    expect(args[0]).toBe('fork');
+    expect(args.at(-1)).toBe('traex-parent');
+    expect(args).toContain('/workspace');
+  });
+
+  it('traex restarts a completed fork child with ordinary resume', () => {
+    const traex = createTraexAdapter('/bin/traecli');
+    const args = traex.buildArgs({
+      sessionId: 'botmux-child',
+      resume: true,
+      resumeSessionId: 'traex-child',
+      forkSession: false,
+    });
+    expect(args[0]).toBe('resume');
+    expect(args.at(-1)).toBe('traex-child');
   });
 
   it('does not inject a stale turn id into Codex shell environment policy', () => {

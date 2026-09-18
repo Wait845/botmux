@@ -3334,6 +3334,70 @@ function reconcileDeferredTopicBinding(ds: DaemonSession): string | undefined {
 
 const deferredScheduleSettleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+/**
+ * Promote a materialized task-position (`executionPosition:'task'`) silent run
+ * from its stable virtual slot (`schedule-task:<taskId>`) to the real om_ topic
+ * slot, and write the materialized root back onto the task row so every later
+ * fire resolves to this thread.
+ *
+ * The whole transition — guards, task writeback, scope flip and map move — runs
+ * under BOTH key locks in virtual→real order with an identity CAS. If this
+ * session no longer owns the virtual slot, or the real slot was taken meanwhile,
+ * NOTHING is mutated: no root writeback, the deferred marker survives, scope
+ * stays chat and this session keeps its virtual registration. The om_ root is a
+ * message this session itself just published, so a real-slot occupant is
+ * theoretically impossible; logging and keeping state beats silently
+ * overwriting a competing session.
+ */
+async function promoteMaterializedTaskPositionSession(
+  sessions: Map<string, DaemonSession>,
+  ds: DaemonSession,
+  rootMessageId: string,
+): Promise<'promoted' | 'not_task_position' | 'virtual_lost' | 'real_key_occupied'> {
+  const run = ds.session.deferredScheduleRun;
+  if (!run || !run.routingAnchor.startsWith('schedule-task:')) {
+    return 'not_task_position';
+  }
+  const larkAppId = ds.larkAppId;
+  const virtualKey = sessionKey(run.routingAnchor, larkAppId);
+  const realKey = sessionKey(rootMessageId, larkAppId);
+  return withActiveSessionKeyLock(sessions, virtualKey, async () =>
+    withActiveSessionKeyLock(sessions, realKey, () => {
+      if (sessions.get(virtualKey) !== ds) {
+        logger.error(
+          `[scheduler] Task-position promotion lost virtual slot ${virtualKey} `
+          + `session=${ds.session.sessionId.slice(0, 8)}; state and live map left unchanged`,
+        );
+        return 'virtual_lost' as const;
+      }
+      const occupant = sessions.get(realKey);
+      if (occupant && occupant !== ds) {
+        logger.error(
+          `[scheduler] Task-position real slot already occupied by `
+          + `${occupant.session.sessionId.slice(0, 8)} while promoting `
+          + `${ds.session.sessionId.slice(0, 8)}; state and live map left unchanged`,
+        );
+        return 'real_key_occupied' as const;
+      }
+      // Guards passed — commit the durable/session state first, then move the
+      // live registration. reconcileDeferredTopicBinding already set
+      // rootMessageId + aliases on the session.
+      scheduleStore.updateTask(run.taskId, { rootMessageId }, larkAppId);
+      ds.session.deferredScheduleRun = undefined;
+      ds.session.scope = 'thread';
+      ds.scope = 'thread';
+      sessionStore.updateSession(ds.session);
+      sessions.delete(virtualKey);
+      sessions.set(realKey, ds);
+      logger.info(
+        `[scheduler] Task-position session promoted virtual=${virtualKey} real=${realKey} `
+        + `session=${ds.session.sessionId.slice(0, 8)}`,
+      );
+      return 'promoted' as const;
+    }),
+  );
+}
+
 function scheduleDeferredScheduleSettlement(
   ds: DaemonSession,
   context: { turnId: string; source: 'terminal' | 'idle' },
@@ -3369,6 +3433,21 @@ function scheduleDeferredScheduleSettlement(
         logger.info(
           `[scheduler] Deferred topic materialized session=${sessionId.slice(0, 8)} root=${result.rootMessageId.slice(0, 12)}`,
         );
+        // Task-position runs own a stable per-task slot: promote the session to
+        // the real topic key and persist the root on the task. new-topic runs
+        // keep their per-run virtual anchor (already aliased by reconcile).
+        if (ds.session.deferredScheduleRun?.routingAnchor.startsWith('schedule-task:')) {
+          void promoteMaterializedTaskPositionSession(
+            activeSessions,
+            ds,
+            result.rootMessageId,
+          ).catch((err) => {
+            logger.warn(
+              `[scheduler] Task-position promotion failed session=${sessionId.slice(0, 8)}: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        }
         return;
       }
       if (result.action === 'close_refused') {
@@ -3910,6 +3989,7 @@ async function sessionReply(
 // composition it relies on. See test/reply-target-fallback.test.ts.
 export const __testOnly_sessionReply = sessionReply;
 export const __testOnly_activeSessions = activeSessions;
+export const __testOnly_promoteMaterializedTaskPositionSession = promoteMaterializedTaskPositionSession;
 export const __testOnly_scheduleRestoredStreamingCardPinRecovery = scheduleRestoredStreamingCardPinRecovery;
 export const __testOnly_restoreSessionsAndScheduleStartupRecovery = restoreSessionsAndScheduleStartupRecovery;
 
@@ -4535,7 +4615,8 @@ function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void 
         // owner can't be revived later.
         writeAllowedUsersCache(larkAppId, applied.map, {
           deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
-          retainKeys: configured,
+          // 同启动块：sidecar 两侧共用，retainKeys 取并集，不得剪掉 blockedUsers 的缓存。
+          retainKeys: [...new Set([...configured, ...(liveBot.config.blockedUsers ?? [])])],
         });
         republishResolvedAllowedUsers(larkAppId, applied.resolved);
         if (!applied.failed) {
@@ -21703,7 +21784,6 @@ async function handleThreadReplyAdmitted(
   const parsedResult = prepared ?? parseEventMessage(data);
   const parsed = parsedResult.parsed;
   const resources = parsedResult.resources;
-
   // Expand merge_forward: fetch sub-messages and collect their resources
   if (!prepared && parsed.msgType === 'merge_forward') {
     const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed);
@@ -21771,8 +21851,24 @@ async function handleThreadReplyAdmitted(
   const threadCommandPrompt = ctx.commandTrigger
     ? renderCommandTriggerPrompt(ctx.commandTrigger)
     : undefined;
-  const threadCommandLane = parsed.content.trim();
+  let threadCommandLane = parsed.content.trim();
   if (threadCommandPrompt) parsed.content = threadCommandPrompt;
+
+  // A listener may use chat scope and therefore arrive through an existing
+  // session's reply path after its first match. Apply its untrusted wrapper
+  // only after audio transcription and bot-steer / command-template parsing:
+  // both can rewrite parsed.content, and every later command lane must see the
+  // wrapper rather than the observed message. This deliberately mirrors the
+  // new-topic path's final listener override.
+  let listenerPrompt: string | undefined;
+  if (ctx.messageListener) {
+    refreshListenerCardTextFromResolved(ctx.messageListener, data.message);
+    listenerPrompt = renderMessageListenerPrompt(ctx.messageListener);
+  }
+  if (listenerPrompt) {
+    parsed.content = listenerPrompt;
+    threadCommandLane = listenerPrompt;
+  }
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
   const botSenderPrefix = isForeignBot
@@ -21834,11 +21930,20 @@ async function handleThreadReplyAdmitted(
     return threadSenderCached;
   };
 
-  const content = parsed.content.trim();
+  let content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
   // threadCommandLane 是免@ 命令模板改写**之前**的正文；没有模板时与 content
   // 逐字相同（见上方 threadCommandPrompt 处的说明）。
-  const cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  let cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  // Keep the three values consumed by the remainder of this function in lock
+  // step. In particular, workflow/slash parsing reads cmdContent while worker
+  // injection reads content/parsed.content; listener input is never trusted as
+  // a control command on either path.
+  if (listenerPrompt) {
+    content = listenerPrompt;
+    cmdContent = listenerPrompt;
+    parsed.content = listenerPrompt;
+  }
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   // Tenant-stable union_id of the thread sender — lets canOperate recognise a
   // cross-deployment TEAM peer bot (isTeamBot) and grant it daemon-command
@@ -22009,7 +22114,9 @@ async function handleThreadReplyAdmitted(
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
   // off it falls through to ordinary message handling. Human senders unaffected.
-  const invocation = ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
+  const invocation = ctx.messageListener
+    ? null
+    : ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
     ? null
     : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
@@ -23007,8 +23114,14 @@ async function handleThreadReplyAdmitted(
   // Daemon-side hint: divert an already-known different principal before IPC.
   // The worker remains authoritative and hands a raced rejection back through
   // onOrdinaryImInputRejected; both paths converge on the same durable record.
+  //
+  // Gated by the experimental XPI switch (default OFF). Off ⇒ fall through to
+  // the existing-owner route below, i.e. deliver the message like any other —
+  // byte-for-byte the pre-#1348 shape. The worker reads the same switch, so a
+  // message that is not diverted here is also not rejected there.
   const activePrincipalTurn = ds.activeInteractiveTurn;
-  if (activePrincipalTurn
+  if (config.crossPrincipalInterruption
+    && activePrincipalTurn
     && threadTrustedCaller
     && !sameTrustedPrincipal(activePrincipalTurn.caller, threadTrustedCaller)
     && !sameTrustedPrincipal(activePrincipalTurn.controller, threadTrustedCaller)) {
@@ -25121,6 +25234,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     async onOrdinaryImInputRejected(ds, context) {
       if (!context.rejectedBeforeAdmission
         || context.reason !== 'cross_principal_requires_owner_confirmation') return false;
+      // Experimental XPI switch off ⇒ never stage. Only reachable on a config
+      // TTL skew (the worker still read the switch ON while this daemon reads
+      // it OFF), so staging here would mint exactly the stranded record the
+      // switch exists to prevent. Returning false lets worker-pool retry the
+      // exact turn instead; the worker re-reads the switch on that attempt and
+      // — now agreeing — delivers it. Retries are capped
+      // (ORDINARY_IM_MAX_ATTEMPTS), so a genuinely stuck disagreement surfaces
+      // as a visible delivery failure rather than a silent stranding.
+      if (!config.crossPrincipalInterruption) {
+        logger.warn(
+          `[${tag(ds)}] cross-principal rejection arrived while the XPI switch is off; `
+          + `retrying delivery turn=${context.turnId.slice(0, 12)}`,
+        );
+        return false;
+      }
       const envelope = context.message.type === 'message'
         ? context.message.rerouteEnvelope
         : undefined;
@@ -25553,6 +25681,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Refresh CLI version per bot's cliId
     refreshCliVersion(cfg);
 
+    // sidecar 同时承载 allowedUsers 与 blockedUsers 的 raw→ou_ 缓存：任一侧
+    // 写缓存时 retainKeys 必须是两侧原始条目的并集，否则一次 allowed 解析写回
+    // 会把 blocked 条目（可能正处于网络失败、只靠缓存存活的状态）剪光，反之亦然。
+    const resolveCacheRetainKeys = [...new Set([
+      ...(bot.config.allowedUsers ?? bot.resolvedAllowedUsers ?? []),
+      ...(bot.config.blockedUsers ?? []),
+    ])];
+
     // Resolve allowed users per bot. Skipped for apiOnly (core-only) bots:
     // their HTTP control-API triggers authenticate via the dashboard token, not
     // allowedUsers, and resolving email/union_id entries would call the Feishu
@@ -25589,7 +25725,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           // Prune definitively-gone entries + keys no longer configured.
           writeAllowedUsersCache(cfg.larkAppId, applied.map, {
             deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
-            retainKeys: configured,
+            retainKeys: resolveCacheRetainKeys,
           });
           logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ') || '(empty)'}${applied.usedFallback ? ' [some from cache]' : ''}`);
           if (applied.failed && applied.notice) {
@@ -25611,7 +25747,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           bot.resolvedAllowedUsers = applied.resolved;
           bot.rawAllowedUserResolution = applied.map;
           if (applied.usedFallback) {
-            writeAllowedUsersCache(cfg.larkAppId, applied.map, { retainKeys: configured });
+            writeAllowedUsersCache(cfg.larkAppId, applied.map, { retainKeys: resolveCacheRetainKeys });
           }
           const notice = applied.notice
             ?? `Failed to resolve allowedUsers: ${err?.message ?? err}`;
@@ -25629,6 +25765,67 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // will eventually catch up too.
       desc.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_'));
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+    }
+
+    // Resolve blockedUsers 黑名单（P1c）。复用 allowedUsers 同一套解析器与同一
+    // sidecar（retainKeys 取两侧并集，见 resolveCacheRetainKeys）。与 allowed 块的
+    // 差异是刻意的：黑名单解析降级只会「少否决」（fail-open 方向，不锁人），所以
+    // 不发 owner DM、不排 scheduleAllowedUsersResolveRetry（那条重试只解析
+    // allowedUsers），只 warn；但绝不能因此阻塞启动。literal ou_ 无需网络，预填进
+    // per-entry 缓存，使 client 构造/网络整体抛错时纯 ou_ 黑名单仍生效。
+    // 同 allowed 块：apiOnly bot 跳过（不打飞书 contact API）；不刷 descriptor。
+    if (!cfg.apiOnly && (bot.config.blockedUsers?.length ?? 0) > 0) {
+      const blockedRaw = bot.config.blockedUsers!;
+      const literalOuSeed: Record<string, string> = {};
+      for (const e of blockedRaw) {
+        if (e.startsWith('ou_')) literalOuSeed[e] = e;
+      }
+      const blockedPrevMap: Record<string, string> = {
+        ...literalOuSeed,
+        ...readAllowedUsersCache(cfg.larkAppId),
+      };
+      let blockedApplied: ReturnType<typeof applyAllowedUsersResolve>;
+      if (blockedRaw.some(entryNeedsContactResolve)) {
+        try {
+          const resolveResult = await resolveAllowedUsersWithMap(cfg.larkAppId, blockedRaw);
+          blockedApplied = applyAllowedUsersResolve({
+            rawEntries: blockedRaw,
+            previousResolvedMap: blockedPrevMap,
+            resolveResult,
+          });
+          writeAllowedUsersCache(cfg.larkAppId, blockedApplied.map, {
+            deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
+            retainKeys: resolveCacheRetainKeys,
+          });
+          if (blockedApplied.usedFallback) {
+            logger.warn(`[${cfg.larkAppId}] blockedUsers resolve degraded: some entries reused from cache. Raw: ${blockedRaw.join(', ')}`);
+          }
+        } catch (err: any) {
+          // 整体抛错 = 瞬时故障：所有需寻址条目按 transient 交给纯合并函数吃缓存；
+          // literal ou_ 经 blockedPrevMap 种子照样恢复。绝不阻塞启动。
+          const throwStatus = new Map<string, EntryResolveStatus>();
+          for (const e of blockedRaw) {
+            if (entryNeedsContactResolve(e)) throwStatus.set(e, 'transient');
+          }
+          blockedApplied = applyAllowedUsersResolve({
+            rawEntries: blockedRaw,
+            previousResolvedMap: blockedPrevMap,
+            resolveResult: { resolved: [], map: new Map(), errored: true, entryStatus: throwStatus },
+          });
+          if (blockedApplied.usedFallback) {
+            writeAllowedUsersCache(cfg.larkAppId, blockedApplied.map, { retainKeys: resolveCacheRetainKeys });
+          }
+          logger.warn(`[${cfg.larkAppId}] blockedUsers resolve failed (cache-only this boot): ${err?.message ?? err}`);
+        }
+      } else {
+        blockedApplied = applyAllowedUsersResolve({
+          rawEntries: blockedRaw,
+          previousResolvedMap: blockedPrevMap,
+          resolveResult: { resolved: [], map: new Map(), entryStatus: new Map() },
+        });
+      }
+      bot.resolvedBlockedUsers = blockedApplied.resolved;
+      logger.info(`[${cfg.larkAppId}] Resolved blockedUsers: ${bot.resolvedBlockedUsers.join(', ') || '(empty)'}`);
     }
 
     checkAllowedChatGroupsConfig(bot);
