@@ -4,7 +4,7 @@ import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgent
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
@@ -130,6 +130,8 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
+import { rewindClaudeTranscript, scanClaudeTranscriptCheckpoints } from './context-rewind.js';
+import { DEFAULT_CLAUDE_DATA_DIR, resolveClaudeJsonlPath } from '../adapters/cli/claude-code.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { rehomeReplyTargetState } from './reply-target.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
@@ -3718,6 +3720,127 @@ export async function handleCommand(
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
+        break;
+      }
+
+      case '/rewind': {
+        if (!ds) {
+          await replyNoSession(replyHere, loc);
+          break;
+        }
+        const rewindCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        // Context rollback mutates the CLI's native session store; only Claude Code's
+        // append-only jsonl has a safe truncate-and-resume contract today.
+        if (rewindCliId !== 'claude-code' || isRemoteBackendSession(ds) || isSharedAdoptSession(ds)) {
+          await sessionReply(rootId, t('cmd.rewind.unsupported_cli', { cliName: sessionCliDisplayName(ds) }, loc));
+          break;
+        }
+        if (isSessionTransferring(ds) || hasProtectedSessionMutationOwnership(ds)) {
+          await sessionReply(rootId, t('cmd.rewind.busy', undefined, loc));
+          break;
+        }
+        const rewindSessionId = ds.session.cliSessionId;
+        const rewindJsonl = rewindSessionId
+          ? resolveClaudeJsonlPath(
+              rewindSessionId,
+              getSessionWorkingDir(ds),
+              ds.session.cliConfigDir ?? DEFAULT_CLAUDE_DATA_DIR,
+            )
+          : null;
+        if (!rewindJsonl) {
+          await sessionReply(rootId, t('cmd.rewind.no_transcript', undefined, loc));
+          break;
+        }
+        const rewindArg = message.content.replace(/^\/rewind\s*/i, '').trim();
+        const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, 20);
+        const formatCheckpointAt = (iso?: string): string => {
+          if (!iso) return '-';
+          const d = new Date(iso);
+          if (Number.isNaN(d.getTime())) return iso;
+          const p = (n: number) => String(n).padStart(2, '0');
+          return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+        };
+        if (!rewindArg) {
+          if (checkpoints.length === 0) {
+            await sessionReply(rootId, t('cmd.rewind.list_empty', undefined, loc));
+            break;
+          }
+          const shown = checkpoints.slice(0, 10);
+          const lines = shown.map(cp => t(
+            'cmd.rewind.list_item',
+            { index: cp.index, at: formatCheckpointAt(cp.at), preview: cp.preview },
+            loc,
+          ));
+          await sessionReply(rootId, [
+            t('cmd.rewind.list_header', { count: shown.length }, loc),
+            ...lines,
+            t('cmd.rewind.usage', undefined, loc),
+          ].join('\n'));
+          break;
+        }
+        const rewindMatch = /^(\d+)(?:\s+(confirm))?$/i.exec(rewindArg);
+        if (!rewindMatch) {
+          await sessionReply(rootId, t('cmd.rewind.usage', undefined, loc));
+          break;
+        }
+        const rewindIndex = Number(rewindMatch[1]);
+        if (!Number.isInteger(rewindIndex) || rewindIndex < 1 || rewindIndex > checkpoints.length) {
+          await sessionReply(rootId, t('cmd.rewind.out_of_range', { count: checkpoints.length }, loc));
+          break;
+        }
+        const rewindTarget = checkpoints[rewindIndex - 1]!;
+        const rewindBytes = statSync(rewindJsonl).size - rewindTarget.offset;
+        if (!rewindMatch[2]) {
+          await sessionReply(rootId, t('cmd.rewind.confirm_prompt', {
+            index: rewindIndex,
+            turns: rewindIndex,
+            bytes: rewindBytes,
+          }, loc));
+          break;
+        }
+        const rewindSessionKey = ds.session.sessionId;
+        const rewindOutcome = await withBotTurnMutation(ds.larkAppId, async () => {
+          const current = [...activeSessions.values()].find(
+            candidate => candidate.session.sessionId === rewindSessionKey
+              && candidate.session.status === 'active',
+          );
+          if (!current) return { ok: false as const, code: 'gone' as const };
+          if (hasProtectedSessionMutationOwnership(current)) return { ok: false as const, code: 'busy' as const };
+          // Stop the CLI first so it cannot append to the transcript we are about to cut.
+          const suspended = !current.adoptedFrom && suspendWorker(current, 'context_rewind');
+          if (!suspended) killWorker(current);
+          try {
+            const result = rewindClaudeTranscript(rewindJsonl, rewindTarget.offset);
+            // The CLI will cold-resume from the truncated transcript; drop botmux's
+            // per-turn replay state so /retry and prompt bookkeeping cannot resurrect
+            // a turn that is no longer in context.
+            current.session.lastUserPrompt = undefined;
+            current.session.lastCliInput = undefined;
+            current.session.lastFailedTurn = undefined;
+            sessionStore.updateSession(current.session);
+            return { ok: true as const, ...result };
+          } catch (err) {
+            return {
+              ok: false as const,
+              code: 'error' as const,
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+        });
+        if (!rewindOutcome.ok) {
+          if (rewindOutcome.code === 'gone') await replyNoSession(replyHere, loc);
+          else if (rewindOutcome.code === 'busy') await sessionReply(rootId, t('cmd.rewind.busy', undefined, loc));
+          else await sessionReply(rootId, t('cmd.rewind.failed', { error: rewindOutcome.error ?? 'unknown' }, loc));
+          break;
+        }
+        logger.info(
+          `[${logTag}] /rewind rolled back ${rewindIndex} turn(s), removed ${rewindOutcome.removedBytes} bytes, backup ${rewindOutcome.backupPath}`,
+        );
+        await sessionReply(rootId, t('cmd.rewind.done', {
+          turns: rewindIndex,
+          bytes: rewindOutcome.removedBytes,
+          backup: rewindOutcome.backupPath,
+        }, loc));
         break;
       }
 
