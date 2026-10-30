@@ -6521,6 +6521,7 @@ export async function handleCommand(
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
           t('help.retry', undefined, loc),
+          t('help.rewind', undefined, loc),
           t('help.queue', undefined, loc),
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
