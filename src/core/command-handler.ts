@@ -130,8 +130,10 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
-import { rewindClaudeTranscript, scanClaudeTranscriptCheckpoints } from './context-rewind.js';
-import { DEFAULT_CLAUDE_DATA_DIR, resolveClaudeJsonlPath } from '../adapters/cli/claude-code.js';
+import { findCheckpoint, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, type RewindCheckpoint } from './context-rewind.js';
+import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
+import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
+import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { rehomeReplyTargetState } from './reply-target.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
@@ -1828,6 +1830,16 @@ function latestClosedSessionAt(anchor: string): import('../types.js').Session | 
       && !isPrincipalLaneShadowRow(s)
       && !!(s.cliSessionId || s.lastCliInput || s.lastUserPrompt))
     .sort((a, b) => Date.parse(b.closedAt ?? b.createdAt) - Date.parse(a.closedAt ?? a.createdAt))[0];
+}
+
+/** `/rewind <n>` 预览过的目标（按 botmux sessionId）。确认是另一条命令：没有这份
+ *  记录时，`/rewind <n> confirm` 会按「此刻」的第 n 轮执行——预览后新来一轮就会多删
+ *  一轮。确认时要求序号与目标身份（uuid）都与预览一致，否则重新预览。 */
+const pendingRewindPreviews = new Map<string, { index: number; target: RewindCheckpoint }>();
+
+/** Test isolation hook. */
+export function resetPendingRewindPreviewsForTest(): void {
+  pendingRewindPreviews.clear();
 }
 
 export async function handleCommand(
@@ -3731,7 +3743,7 @@ export async function handleCommand(
         const rewindCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
         // Context rollback mutates the CLI's native session store; only Claude Code's
         // append-only jsonl has a safe truncate-and-resume contract today.
-        if (rewindCliId !== 'claude-code' || isRemoteBackendSession(ds) || isSharedAdoptSession(ds)) {
+        if (rewindCliId !== 'claude-code' || isRemoteBackendSession(ds) || isSharedAdoptSession(ds) || ds.adoptedFrom) {
           await sessionReply(rootId, t('cmd.rewind.unsupported_cli', { cliName: sessionCliDisplayName(ds) }, loc));
           break;
         }
@@ -3739,13 +3751,24 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.rewind.busy', undefined, loc));
           break;
         }
-        const rewindSessionId = ds.session.cliSessionId;
-        const rewindJsonl = rewindSessionId
-          ? resolveClaudeJsonlPath(
-              rewindSessionId,
-              getSessionWorkingDir(ds),
-              ds.session.cliConfigDir ?? DEFAULT_CLAUDE_DATA_DIR,
-            )
+        // Same idle gate as /fork: cutting a transcript mid-turn would drop the
+        // half-written turn while the live CLI still holds it in memory.
+        const rewindScreen = ds.lastScreenStatus;
+        if (ds.worker && !ds.worker.killed && rewindScreen !== 'idle' && rewindScreen !== 'limited') {
+          await sessionReply(rootId, t('cmd.rewind.busy', undefined, loc));
+          break;
+        }
+        // The canonical resolver follows the frozen config profile and the sandbox
+        // BOT_HOME redirect — the paths the CLI actually wrote.
+        const rewindJsonl = ds.session.cliSessionId
+          ? resolveSessionTranscriptPath({
+              cliId: 'claude-code',
+              sessionId: ds.session.sessionId,
+              cliSessionId: ds.session.cliSessionId,
+              cwd: getSessionWorkingDir(ds),
+              larkAppId: ds.larkAppId,
+              fresh: true,
+            })?.path ?? null
           : null;
         if (!rewindJsonl) {
           await sessionReply(rootId, t('cmd.rewind.no_transcript', undefined, loc));
@@ -3767,8 +3790,8 @@ export async function handleCommand(
           }
           const shown = checkpoints.slice(0, 10);
           const lines = shown.map(cp => t(
-            'cmd.rewind.list_item',
-            { index: cp.index, at: formatCheckpointAt(cp.at), preview: cp.preview },
+            cp.beforeCompaction ? 'cmd.rewind.list_item_compacted' : 'cmd.rewind.list_item',
+            { index: cp.index, at: formatCheckpointAt(cp.at), preview: cp.preview || t('cmd.rewind.no_text', undefined, loc) },
             loc,
           ));
           await sessionReply(rootId, [
@@ -3789,31 +3812,83 @@ export async function handleCommand(
           break;
         }
         const rewindTarget = checkpoints[rewindIndex - 1]!;
-        const rewindBytes = statSync(rewindJsonl).size - rewindTarget.offset;
-        if (!rewindMatch[2]) {
-          await sessionReply(rootId, t('cmd.rewind.confirm_prompt', {
-            index: rewindIndex,
-            turns: rewindIndex,
-            bytes: rewindBytes,
-          }, loc));
+        if (rewindTarget.beforeCompaction) {
+          await sessionReply(rootId, t('cmd.rewind.before_compaction', { index: rewindIndex }, loc));
+          break;
+        }
+        if (!rewindTarget.resumable) {
+          await sessionReply(rootId, t('cmd.rewind.first_turn', { index: rewindIndex }, loc));
           break;
         }
         const rewindSessionKey = ds.session.sessionId;
+        const rewindSize = statSync(rewindJsonl).size;
+        const pendingPreview = pendingRewindPreviews.get(rewindSessionKey);
+        if (rewindMatch[2] && pendingPreview && (
+          pendingPreview.index !== rewindIndex
+          || !findCheckpoint([rewindTarget], pendingPreview.target)
+        )) {
+          pendingRewindPreviews.delete(rewindSessionKey);
+          await sessionReply(rootId, t('cmd.rewind.moved', undefined, loc));
+          break;
+        }
+        if (!rewindMatch[2] || !pendingPreview) {
+          // Confirm without a matching preview falls back to a preview: the user
+          // must see exactly what will be removed before anything is cut.
+          pendingRewindPreviews.set(rewindSessionKey, { index: rewindIndex, target: rewindTarget });
+          await sessionReply(rootId, t('cmd.rewind.confirm_prompt', {
+            index: rewindIndex,
+            turns: rewindIndex,
+            bytes: rewindSize - rewindTarget.offset,
+            preview: rewindTarget.preview || t('cmd.rewind.no_text', undefined, loc),
+          }, loc));
+          break;
+        }
+        pendingRewindPreviews.delete(rewindSessionKey);
         const rewindOutcome = await withBotTurnMutation(ds.larkAppId, async () => {
           const current = [...activeSessions.values()].find(
             candidate => candidate.session.sessionId === rewindSessionKey
               && candidate.session.status === 'active',
           );
           if (!current) return { ok: false as const, code: 'gone' as const };
-          if (hasProtectedSessionMutationOwnership(current)) return { ok: false as const, code: 'busy' as const };
+          if (hasProtectedSessionMutationOwnership(current) || isSessionTransferring(current)) {
+            return { ok: false as const, code: 'busy' as const };
+          }
+          const st = current.lastScreenStatus;
+          if (current.worker && !current.worker.killed && st !== 'idle' && st !== 'limited') {
+            return { ok: false as const, code: 'busy' as const };
+          }
           // Stop the CLI first so it cannot append to the transcript we are about to cut.
-          const suspended = !current.adoptedFrom && suspendWorker(current, 'context_rewind');
+          const stoppingWorker = current.worker;
+          const suspended = suspendWorker(current, 'context_rewind');
           if (!suspended) killWorker(current);
+          // suspend/kill only send IPC. The worker tears the CLI down (tmux
+          // destroySession / pty kill) before it exits, so wait for the worker
+          // process itself (SIGKILL backstop is 7s), then for the file to settle.
+          const exited = stoppingWorker ? trackProcessExited(stoppingWorker) : { alreadyExited: true };
+          if (!exited.alreadyExited && exited.done
+            && !await waitAllWithin([exited.done], Date.now() + 15_000)) {
+            return { ok: false as const, code: 'error' as const, error: 'worker did not exit' };
+          }
+          if (!await waitForTranscriptQuiet(rewindJsonl)) {
+            return { ok: false as const, code: 'error' as const, error: 'transcript is still being written' };
+          }
           try {
-            const result = rewindClaudeTranscript(rewindJsonl, rewindTarget.offset);
-            // The CLI will cold-resume from the truncated transcript; drop botmux's
-            // per-turn replay state so /retry and prompt bookkeeping cannot resurrect
-            // a turn that is no longer in context.
+            // Re-resolve the target by identity: the file may have gained a turn
+            // between preview and confirm, which shifts every index.
+            const target = findCheckpoint(scanClaudeTranscriptCheckpoints(rewindJsonl, 50), pendingPreview.target);
+            // index must still match: a turn that landed after the preview would
+            // otherwise be removed silently along with the previewed ones.
+            if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
+              return { ok: false as const, code: 'moved' as const };
+            }
+            const result = rewindClaudeTranscript(rewindJsonl, target.offset);
+            // Interrupted-turn journal offsets point into the removed tail; a
+            // restore from them would replay dropped output or warn spuriously.
+            clearBridgeTurnJournal(join(config.session.dataDir, 'turn-marks', `${current.session.sessionId}.json`));
+            // The CLI will cold-resume from the truncated transcript under the SAME
+            // native session id, so group-context coverage still marks the dropped
+            // turn's background as delivered and it is not re-injected. Drop
+            // botmux's per-turn replay state so /retry cannot resurrect the turn.
             current.session.lastUserPrompt = undefined;
             current.session.lastCliInput = undefined;
             current.session.lastFailedTurn = undefined;
@@ -3830,11 +3905,12 @@ export async function handleCommand(
         if (!rewindOutcome.ok) {
           if (rewindOutcome.code === 'gone') await replyNoSession(replyHere, loc);
           else if (rewindOutcome.code === 'busy') await sessionReply(rootId, t('cmd.rewind.busy', undefined, loc));
+          else if (rewindOutcome.code === 'moved') await sessionReply(rootId, t('cmd.rewind.moved', undefined, loc));
           else await sessionReply(rootId, t('cmd.rewind.failed', { error: rewindOutcome.error ?? 'unknown' }, loc));
           break;
         }
         logger.info(
-          `[${logTag}] /rewind rolled back ${rewindIndex} turn(s), removed ${rewindOutcome.removedBytes} bytes, backup ${rewindOutcome.backupPath}`,
+          `[${logTag}] /rewind rolled back to checkpoint ${rewindIndex}, removed ${rewindOutcome.removedBytes} bytes, backup ${rewindOutcome.backupPath}`,
         );
         await sessionReply(rootId, t('cmd.rewind.done', {
           turns: rewindIndex,
