@@ -3991,7 +3991,7 @@ export async function handleCommand(
           logger.info(
             `[${logTag}] /rewind rolled back to checkpoint ${rewindIndex}, removed ${rewindOutcome.removedBytes} bytes, backup ${rewindOutcome.backupPath}`,
           );
-          await sessionReply(rootId, rewindOutcome.cleanupError
+          const rewindDoneMessage = rewindOutcome.cleanupError
             ? t('cmd.rewind.done_cleanup_warn', {
               turns: rewindIndex,
               bytes: rewindOutcome.removedBytes,
@@ -4002,7 +4002,24 @@ export async function handleCommand(
               turns: rewindIndex,
               bytes: rewindOutcome.removedBytes,
               backup: rewindOutcome.backupPath,
-            }, loc));
+            }, loc);
+          // The truncation + backup are already durable here, and this notice
+          // is the ONLY message carrying the backup path. A send failure
+          // (root-message 400, network) must not unwind to the outer catch,
+          // which would answer "回退失败" against the already-cut file and
+          // invite a retry against shifted indices — same ordering rule as
+          // /fork's created notice. Swallow locally, then make one minimal
+          // retry that still carries the backup path.
+          try {
+            await sessionReply(rootId, rewindDoneMessage);
+          } catch (sendErr) {
+            logger.warn(`[${logTag}] /rewind succeeded but the done reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}; backup ${rewindOutcome.backupPath}`);
+            try {
+              await sessionReply(rootId, t('cmd.rewind.done_plain', { backup: rewindOutcome.backupPath }, loc));
+            } catch (fallbackErr) {
+              logger.warn(`[${logTag}] /rewind plain-text fallback reply also failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}; backup ${rewindOutcome.backupPath}`);
+            }
+          }
         } catch (err) {
           const errorText = err instanceof Error ? err.message : String(err);
           const errnoCode = (err as NodeJS.ErrnoException | null)?.code;

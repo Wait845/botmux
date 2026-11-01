@@ -190,20 +190,40 @@ export interface RewindResult {
  * 打开之后被换成软链（unlink + symlink）也只会截断/备份原 inode，绝不沿路径重新
  * 打开去读链接目标。
  */
+/** 打开后的 inode 必须就是 lstat 看到的那个。O_NOFOLLOW 只挡得住「换成软链」
+ *  （open 直接失败），挡不住路径在两步之间被换成**另一个普通文件**——那同样会
+ *  通过校验并截断一个无关文件。dev+ino 任一不符即拒绝。 */
+export function assertSameInode(
+  expected: { dev: number; ino: number },
+  actual: { dev: number; ino: number },
+  path: string,
+): void {
+  if (expected.dev !== actual.dev || expected.ino !== actual.ino) {
+    throw new Error(`refusing to rewind: ${path} was replaced between validation and open`);
+  }
+}
+
 export function rewindClaudeTranscript(
   path: string,
   offset: number,
   now: number = Date.now(),
   opts: {
+    /** Test seam: runs after lstat validated the pathname but BEFORE it is
+     *  opened. Reproduces the lstat→open race window. */
+    beforeOpen?: () => void;
     /** Test seam: runs after the source descriptor was validated and opened
      *  but before the backup is read from it. Lets the symlink-swap regression
      *  replace the pathname deterministically mid-operation. */
     beforeBackup?: () => void;
   } = {},
 ): RewindResult {
-  if (!lstatSync(path).isFile()) throw new Error(`refusing to rewind non-regular file ${path}`);
+  const pre = lstatSync(path);
+  if (!pre.isFile()) throw new Error(`refusing to rewind non-regular file ${path}`);
+  opts.beforeOpen?.();
   const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
   try {
+    // Pin the descriptor to the inode lstat inspected (regular-file swap TOCTOU).
+    assertSameInode({ dev: pre.dev, ino: pre.ino }, fstatSync(fd), path);
     return rewindOpenTranscript(fd, path, offset, now, opts);
   } finally {
     closeSync(fd);

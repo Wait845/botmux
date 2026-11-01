@@ -1025,6 +1025,7 @@ export const messages: Record<string, string> = {
   'cmd.rewind.confirm_prompt': '将回退到第 {index} 个检查点之前（「{preview}」）：删除该轮及之后共 {turns} 轮、{bytes} 字节。回复 `/rewind {index} confirm` 执行（会先备份 transcript）。',
   'cmd.rewind.done': '✅ 已回退：删除 {turns} 轮（{bytes} 字节），原 transcript 备份在 {backup}。下一条消息会冷启动续上下文。',
   'cmd.rewind.done_cleanup_warn': '✅ 已回退：删除 {turns} 轮（{bytes} 字节），原 transcript 备份在 {backup}，下一条消息会冷启动续上下文。⚠️ 回退后的中断轮日志清理失败（{error}），不影响回退结果；若后续看到「跳过中断回合补投」类提示可忽略，或联系维护者手动清理该日志。',
+  'cmd.rewind.done_plain': '✅ 上下文已成功回退；原 transcript 备份在 {backup}，下一条消息会从回退后的上下文继续。（详细回执发送失败，这是兜底通知）',
   'cmd.rewind.failed': '❌ 回退失败：{error}',
   'cmd.rewind.list_item_compacted': '{index}. {at} · {preview}（已压缩，不可回退）',
   'cmd.rewind.before_compaction': '⚠️ 第 {index} 个检查点在最近一次压缩（/compact）之前，它的内容已经并入压缩摘要，截断会连摘要一起丢掉，所以不能回退到这里。只能回退到压缩之后的轮次。',

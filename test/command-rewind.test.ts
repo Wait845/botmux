@@ -127,7 +127,7 @@ vi.mock('../src/utils/timezone.js', () => ({ scheduleTimeZone: vi.fn() }));
 const { sendWorkerInput, forkWorker, rememberLastCliInput, suspendWorker, killWorker, rewindState, backendState } = vi.hoisted(() => ({
   suspendWorker: vi.fn<(ds: any, reason?: string) => boolean>(),
   killWorker: vi.fn<(ds: any) => void>(),
-  rewindState: { jsonl: '' as string },
+  rewindState: { jsonl: '' as string, truncateError: '' as string },
   backendState: { backingType: undefined as string | undefined, probe: 'missing' as string, killThrows: false },
   sendWorkerInput: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
   forkWorker: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
@@ -285,6 +285,20 @@ vi.mock('../src/services/session-groups-store.js', () => ({ isSessionGroup: vi.f
 vi.mock('../src/services/transcript-resolver.js', () => ({
   resolveSessionTranscriptPath: vi.fn(() => (rewindState.jsonl ? { path: rewindState.jsonl, kind: 'claude' } : null)),
 }));
+
+// Default-delegate to the real module; a test can arm rewindState.truncateError
+// to make the truncation step itself throw (backup target occupied, …) so the
+// pre-cut replay-state rollback can be asserted through the real handler.
+vi.mock('../src/core/context-rewind.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/context-rewind.js')>();
+  return {
+    ...actual,
+    rewindClaudeTranscript: (...args: Parameters<typeof actual.rewindClaudeTranscript>) => {
+      if (rewindState.truncateError) throw new Error(rewindState.truncateError);
+      return actual.rewindClaudeTranscript(...args);
+    },
+  };
+});
 vi.mock('../src/core/shared-adopt.js', () => ({ isSharedAdoptSession: vi.fn(() => false) }));
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
@@ -377,6 +391,7 @@ beforeEach(() => {
 afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   rewindState.jsonl = '';
+  rewindState.truncateError = '';
 });
 
 describe('/rewind command', () => {
@@ -561,6 +576,54 @@ describe('/rewind command', () => {
     expect(lastReply(deps)).toContain('日志清理失败');
     expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A']);
     expect(existsSync(journalPath)).toBe(true);
+  });
+
+  it('持久后端 kill 抛错：fail-closed 拒绝且文件不动', async () => {
+    rewindState.jsonl = transcript();
+    const ds = makeDs('claude-code', null);
+    const deps = makeDeps(ds);
+    backendState.backingType = 'tmux';
+    backendState.killThrows = true;
+    await run(deps, '/rewind 1');
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+    expect(lastReply(deps)).toContain('could not verify');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('截断自身失败：回复失败、文件不动、replay 字段回滚', async () => {
+    rewindState.jsonl = transcript();
+    const ds = makeDs();
+    const deps = makeDeps(ds);
+    await run(deps, '/rewind 2');
+    rewindState.truncateError = 'backup target occupied';
+    await run(deps, '/rewind 2 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+    expect(lastReply(deps)).toContain('backup target occupied');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B', 'C']);
+    // Replay state was persisted-clear then restored, so /retry keeps its input.
+    expect(ds.session.lastUserPrompt).toBe('C');
+  });
+
+  it('成功回执发送失败：不回报失败，纯文本兜底仍送达备份路径', async () => {
+    rewindState.jsonl = transcript();
+    const ds = makeDs();
+    const deps = makeDeps(ds);
+    let replyCalls = 0;
+    deps.sessionReply.mockImplementation(async () => {
+      replyCalls += 1;
+      // Preview is call 1; the done notice (call 2) fails like an expired root.
+      if (replyCalls === 2) throw new Error('lark 400 root expired');
+      return 'reply-msg-id';
+    });
+    await run(deps, '/rewind 1');
+    await run(deps, '/rewind 1 confirm');
+    const allReplies = deps.sessionReply.mock.calls.map(c => String(c[1] ?? ''));
+    expect(allReplies.some(r => r.includes('回退失败'))).toBe(false);
+    expect(allReplies.at(-1)).toContain('.bak');
+    expect(allReplies.at(-1)).toContain('已成功回退');
+    // The rewind itself still landed.
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B']);
   });
 
   it('预览后会话又被 compact：锁内重扫发现目标落在压缩点之前，拒绝（moved）', async () => {

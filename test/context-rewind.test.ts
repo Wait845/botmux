@@ -1,8 +1,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  assertSameInode,
   findCheckpoint,
   rewindClaudeTranscript,
   scanClaudeTranscriptCheckpoints,
@@ -156,6 +157,14 @@ describe('rewindClaudeTranscript', () => {
   });
 });
 
+describe('assertSameInode', () => {
+  it('dev/ino 一致时放行，任一不符即拒绝', () => {
+    expect(() => assertSameInode({ dev: 1, ino: 2 }, { dev: 1, ino: 2 }, 'x')).not.toThrow();
+    expect(() => assertSameInode({ dev: 1, ino: 2 }, { dev: 1, ino: 3 }, 'x')).toThrow(/replaced between validation and open/);
+    expect(() => assertSameInode({ dev: 1, ino: 2 }, { dev: 9, ino: 2 }, 'x')).toThrow(/replaced between validation and open/);
+  });
+});
+
 describe('rewindClaudeTranscript 文件安全', () => {
   it('拒绝符号链接，不截断链接指向的文件', () => {
     const real = fixture([userTurn('a', 'u1'), userTurn('b', 'u2')]);
@@ -209,6 +218,62 @@ describe('rewindClaudeTranscript 文件安全', () => {
     // 截断落在被钉住的原 inode（此刻挂在 aside 路径下）。
     expect(statSync(aside).size).toBe(latest!.offset);
     expect(readFileSync(aside, 'utf8')).not.toContain('第二轮');
+  });
+
+  it('备份期间源文件被追加（大小变化）：拒绝截断并清掉半成品备份', () => {
+    const path = fixture([userTurn('第一轮', 'u1'), assistant, userTurn('第二轮', 'u2')]);
+    const before = statSync(path).size;
+    const now = Date.UTC(2026, 9, 31, 4, 0, 0);
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+    const backupPath = `${path}.rewind-${stamp}.bak`;
+    const [latest] = scanClaudeTranscriptCheckpoints(path);
+    expect(() => rewindClaudeTranscript(
+      path,
+      latest!.offset,
+      now,
+      { beforeBackup: () => appendFileSync(path, JSON.stringify(userTurn('晚到', 'uLate')) + '\n') },
+    )).toThrow(/changed size/);
+    // 活 CLI 还在写的文件没有被截断。
+    expect(statSync(path).size).toBeGreaterThan(before);
+    expect(readFileSync(path, 'utf8')).toContain('第二轮');
+    expect(existsSync(backupPath)).toBe(false);
+  });
+
+  it('备份目标路径被目录占用：失败且原文件不动（replay 回滚由 handler 用例钉）', () => {
+    const path = fixture([userTurn('第一轮', 'u1'), assistant, userTurn('第二轮', 'u2')]);
+    const now = Date.UTC(2026, 9, 31, 5, 0, 0);
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+    const backupDir = `${path}.rewind-${stamp}.bak`;
+    mkdirSync(backupDir);
+    const before = statSync(path).size;
+    const [latest] = scanClaudeTranscriptCheckpoints(path);
+    expect(() => rewindClaudeTranscript(path, latest!.offset, now)).toThrow();
+    expect(statSync(path).size).toBe(before);
+    expect(readFileSync(path, 'utf8')).toContain('第二轮');
+  });
+
+  it('lstat 与 open 之间被换成另一个普通文件：拒绝，两个文件都不截断', () => {
+    const path = fixture([userTurn('第一轮', 'u1'), assistant, userTurn('第二轮', 'u2')]);
+    const foreign = fixture([userTurn('无关会话', 'uX'), assistant]);
+    const originalSize = statSync(path).size;
+    const foreignSize = statSync(foreign).size;
+    const [latest] = scanClaudeTranscriptCheckpoints(path);
+    expect(() => rewindClaudeTranscript(
+      path,
+      latest!.offset,
+      Date.now(),
+      {
+        beforeOpen: () => {
+          // Reproduce the lstat→open race: the pathname now names a different
+          // REGULAR file (O_NOFOLLOW would only catch a symlink).
+          renameSync(path, `${path}.hidden`);
+          renameSync(foreign, path);
+        },
+      },
+    )).toThrow(/replaced between validation and open/);
+    // Neither the original transcript nor the swapped-in file was truncated.
+    expect(statSync(`${path}.hidden`).size).toBe(originalSize);
+    expect(statSync(path).size).toBe(foreignSize);
   });
 });
 
