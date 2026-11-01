@@ -27,7 +27,7 @@ import { scheduledTaskRunAs } from './schedule-run-as.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
-import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { getSessionPersistentBackendType, isRemoteBackendSession, killPersistentBackendTarget, persistentBackendTargetForSession, probePersistentBackendTargetAfterKill, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { TABLE_AUTO_ROW_STYLE } from '../im/lark/table-style.js';
@@ -130,7 +130,7 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
-import { findCheckpoint, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, type RewindCheckpoint } from './context-rewind.js';
+import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
 import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
 import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
@@ -3775,148 +3775,243 @@ export async function handleCommand(
           break;
         }
         const rewindArg = message.content.replace(/^\/rewind\s*/i, '').trim();
-        const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, 20);
-        const formatCheckpointAt = (iso?: string): string => {
-          if (!iso) return '-';
-          const d = new Date(iso);
-          if (Number.isNaN(d.getTime())) return iso;
-          const p = (n: number) => String(n).padStart(2, '0');
-          return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-        };
-        if (!rewindArg) {
-          if (checkpoints.length === 0) {
-            await sessionReply(rootId, t('cmd.rewind.list_empty', undefined, loc));
+        // Everything after the CLI/path gates touches the filesystem and can
+        // throw (file rotated away by /clear, EACCES, …). HandleCommand's
+        // top-level catch only logs, so without this local catch the user gets
+        // NO reply while the CLI may already have been stopped.
+        try {
+          const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, REWIND_CHECKPOINT_LIMIT);
+          const formatCheckpointAt = (iso?: string): string => {
+            if (!iso) return '-';
+            const d = new Date(iso);
+            if (Number.isNaN(d.getTime())) return iso;
+            const p = (n: number) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+          };
+          if (!rewindArg) {
+            if (checkpoints.length === 0) {
+              await sessionReply(rootId, t('cmd.rewind.list_empty', undefined, loc));
+              break;
+            }
+            // List and accepted range share one limit: an index never shown is
+            // never accepted either.
+            const shown = checkpoints.slice(0, REWIND_CHECKPOINT_LIMIT);
+            const lines = shown.map(cp => t(
+              cp.beforeCompaction ? 'cmd.rewind.list_item_compacted' : 'cmd.rewind.list_item',
+              { index: cp.index, at: formatCheckpointAt(cp.at), preview: cp.preview || t('cmd.rewind.no_text', undefined, loc) },
+              loc,
+            ));
+            await sessionReply(rootId, [
+              t('cmd.rewind.list_header', { count: shown.length }, loc),
+              ...lines,
+              t('cmd.rewind.usage', undefined, loc),
+            ].join('\n'));
             break;
           }
-          const shown = checkpoints.slice(0, 10);
-          const lines = shown.map(cp => t(
-            cp.beforeCompaction ? 'cmd.rewind.list_item_compacted' : 'cmd.rewind.list_item',
-            { index: cp.index, at: formatCheckpointAt(cp.at), preview: cp.preview || t('cmd.rewind.no_text', undefined, loc) },
-            loc,
-          ));
-          await sessionReply(rootId, [
-            t('cmd.rewind.list_header', { count: shown.length }, loc),
-            ...lines,
-            t('cmd.rewind.usage', undefined, loc),
-          ].join('\n'));
-          break;
-        }
-        const rewindMatch = /^(\d+)(?:\s+(confirm))?$/i.exec(rewindArg);
-        if (!rewindMatch) {
-          await sessionReply(rootId, t('cmd.rewind.usage', undefined, loc));
-          break;
-        }
-        const rewindIndex = Number(rewindMatch[1]);
-        if (!Number.isInteger(rewindIndex) || rewindIndex < 1 || rewindIndex > checkpoints.length) {
-          await sessionReply(rootId, t('cmd.rewind.out_of_range', { count: checkpoints.length }, loc));
-          break;
-        }
-        const rewindTarget = checkpoints[rewindIndex - 1]!;
-        if (rewindTarget.beforeCompaction) {
-          await sessionReply(rootId, t('cmd.rewind.before_compaction', { index: rewindIndex }, loc));
-          break;
-        }
-        if (!rewindTarget.resumable) {
-          await sessionReply(rootId, t('cmd.rewind.first_turn', { index: rewindIndex }, loc));
-          break;
-        }
-        const rewindSessionKey = ds.session.sessionId;
-        const rewindSize = statSync(rewindJsonl).size;
-        const pendingPreview = pendingRewindPreviews.get(rewindSessionKey);
-        if (rewindMatch[2] && pendingPreview && (
-          pendingPreview.index !== rewindIndex
-          || !findCheckpoint([rewindTarget], pendingPreview.target)
-        )) {
+          const rewindMatch = /^(\d+)(?:\s+(confirm))?$/i.exec(rewindArg);
+          if (!rewindMatch) {
+            await sessionReply(rootId, t('cmd.rewind.usage', undefined, loc));
+            break;
+          }
+          const rewindIndex = Number(rewindMatch[1]);
+          if (!Number.isInteger(rewindIndex) || rewindIndex < 1 || rewindIndex > checkpoints.length) {
+            await sessionReply(rootId, t('cmd.rewind.out_of_range', { count: checkpoints.length }, loc));
+            break;
+          }
+          const rewindTarget = checkpoints[rewindIndex - 1]!;
+          if (rewindTarget.beforeCompaction) {
+            await sessionReply(rootId, t('cmd.rewind.before_compaction', { index: rewindIndex }, loc));
+            break;
+          }
+          if (!rewindTarget.resumable) {
+            await sessionReply(rootId, t('cmd.rewind.first_turn', { index: rewindIndex }, loc));
+            break;
+          }
+          const rewindSessionKey = ds.session.sessionId;
+          const rewindSize = statSync(rewindJsonl).size;
+          const pendingPreview = pendingRewindPreviews.get(rewindSessionKey);
+          if (rewindMatch[2] && pendingPreview && (
+            pendingPreview.index !== rewindIndex
+            || !findCheckpoint([rewindTarget], pendingPreview.target)
+          )) {
+            pendingRewindPreviews.delete(rewindSessionKey);
+            await sessionReply(rootId, t('cmd.rewind.moved', undefined, loc));
+            break;
+          }
+          if (!rewindMatch[2] || !pendingPreview) {
+            // Confirm without a matching preview falls back to a preview: the user
+            // must see exactly what will be removed before anything is cut.
+            pendingRewindPreviews.set(rewindSessionKey, { index: rewindIndex, target: rewindTarget });
+            await sessionReply(rootId, t('cmd.rewind.confirm_prompt', {
+              index: rewindIndex,
+              turns: rewindIndex,
+              bytes: rewindSize - rewindTarget.offset,
+              preview: rewindTarget.preview || t('cmd.rewind.no_text', undefined, loc),
+            }, loc));
+            break;
+          }
           pendingRewindPreviews.delete(rewindSessionKey);
-          await sessionReply(rootId, t('cmd.rewind.moved', undefined, loc));
-          break;
-        }
-        if (!rewindMatch[2] || !pendingPreview) {
-          // Confirm without a matching preview falls back to a preview: the user
-          // must see exactly what will be removed before anything is cut.
-          pendingRewindPreviews.set(rewindSessionKey, { index: rewindIndex, target: rewindTarget });
-          await sessionReply(rootId, t('cmd.rewind.confirm_prompt', {
-            index: rewindIndex,
-            turns: rewindIndex,
-            bytes: rewindSize - rewindTarget.offset,
-            preview: rewindTarget.preview || t('cmd.rewind.no_text', undefined, loc),
-          }, loc));
-          break;
-        }
-        pendingRewindPreviews.delete(rewindSessionKey);
-        const rewindOutcome = await withBotTurnMutation(ds.larkAppId, async () => {
-          const current = [...activeSessions.values()].find(
-            candidate => candidate.session.sessionId === rewindSessionKey
-              && candidate.session.status === 'active',
-          );
-          if (!current) return { ok: false as const, code: 'gone' as const };
-          if (hasProtectedSessionMutationOwnership(current) || isSessionTransferring(current)) {
-            return { ok: false as const, code: 'busy' as const };
-          }
-          const st = current.lastScreenStatus;
-          if (current.worker && !current.worker.killed && st !== 'idle' && st !== 'limited') {
-            return { ok: false as const, code: 'busy' as const };
-          }
-          // Stop the CLI first so it cannot append to the transcript we are about to cut.
-          const stoppingWorker = current.worker;
-          const suspended = suspendWorker(current, 'context_rewind');
-          if (!suspended) killWorker(current);
-          // suspend/kill only send IPC. The worker tears the CLI down (tmux
-          // destroySession / pty kill) before it exits, so wait for the worker
-          // process itself (SIGKILL backstop is 7s), then for the file to settle.
-          const exited = stoppingWorker ? trackProcessExited(stoppingWorker) : { alreadyExited: true };
-          if (!exited.alreadyExited && exited.done
-            && !await waitAllWithin([exited.done], Date.now() + 15_000)) {
-            return { ok: false as const, code: 'error' as const, error: 'worker did not exit' };
-          }
-          if (!await waitForTranscriptQuiet(rewindJsonl)) {
-            return { ok: false as const, code: 'error' as const, error: 'transcript is still being written' };
-          }
-          try {
-            // Re-resolve the target by identity: the file may have gained a turn
-            // between preview and confirm, which shifts every index.
-            const target = findCheckpoint(scanClaudeTranscriptCheckpoints(rewindJsonl, 50), pendingPreview.target);
-            // index must still match: a turn that landed after the preview would
-            // otherwise be removed silently along with the previewed ones.
-            if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
-              return { ok: false as const, code: 'moved' as const };
-            }
-            const result = rewindClaudeTranscript(rewindJsonl, target.offset);
-            // Interrupted-turn journal offsets point into the removed tail; a
-            // restore from them would replay dropped output or warn spuriously.
-            clearBridgeTurnJournal(join(config.session.dataDir, 'turn-marks', `${current.session.sessionId}.json`));
-            // The CLI will cold-resume from the truncated transcript under the SAME
-            // native session id, so group-context coverage still marks the dropped
-            // turn's background as delivered and it is not re-injected. Drop
-            // botmux's per-turn replay state so /retry cannot resurrect the turn.
-            current.session.lastUserPrompt = undefined;
-            current.session.lastCliInput = undefined;
-            current.session.lastFailedTurn = undefined;
-            sessionStore.updateSession(current.session);
-            return { ok: true as const, ...result };
-          } catch (err) {
-            return {
+          const rewindOutcome = await withBotTurnMutation(ds.larkAppId, async () => {
+            const asError = (err: unknown, prefix?: string) => ({
               ok: false as const,
               code: 'error' as const,
-              error: err instanceof Error ? err.message : String(err),
-            };
+              error: `${prefix ? `${prefix}: ` : ''}${err instanceof Error ? err.message : String(err)}`,
+            });
+            const current = [...activeSessions.values()].find(
+              candidate => candidate.session.sessionId === rewindSessionKey
+                && candidate.session.status === 'active',
+            );
+            if (!current) return { ok: false as const, code: 'gone' as const };
+            if (hasProtectedSessionMutationOwnership(current) || isSessionTransferring(current)) {
+              return { ok: false as const, code: 'busy' as const };
+            }
+            const st = current.lastScreenStatus;
+            if (current.worker && !current.worker.killed && st !== 'idle' && st !== 'limited') {
+              return { ok: false as const, code: 'busy' as const };
+            }
+            try {
+              // Stop the CLI first so it cannot append to the transcript we are about to cut.
+              const stoppingWorker = current.worker;
+              const suspended = suspendWorker(current, 'context_rewind');
+              // suspendWorker only covers tmux-family backends; on pty (or when it
+              // refuses) killWorker is the ONLY path that stops the CLI. It must
+              // not be skipped — a live CLI keeps appending to the file we cut.
+              if (!suspended) killWorker(current);
+              // suspend/kill only send IPC. The worker tears the CLI down (tmux
+              // destroySession / pty kill) before it exits, so wait for the worker
+              // process itself (SIGKILL backstop is 7s), then for the file to settle.
+              const exited = stoppingWorker ? trackProcessExited(stoppingWorker) : { alreadyExited: true };
+              if (!exited.alreadyExited && exited.done
+                && !await waitAllWithin([exited.done], Date.now() + 15_000)) {
+                return { ok: false as const, code: 'error' as const, error: 'worker did not exit' };
+              }
+              // Process exit is not proof the persistent backing (tmux/herdr/
+              // zellij/zmx pane) is gone: a workerless session's orphan kill is
+              // best-effort and a SIGKILL-backstopped worker can leave the pane
+              // alive. An idle surviving CLI never grows the file, so the quiet
+              // wait cannot detect it; truncating anyway would let the next cold
+              // spawn RE-ATTACH that CLI (still holding the full old context) and
+              // keep appending to the cut file. Kill once more idempotently and
+              // require a confirmed-missing backing — fail CLOSED here, unlike
+              // /restart which deliberately fails open on an indeterminate pane.
+              const backingType = getSessionPersistentBackendType(current);
+              if (backingType) {
+                const backingTarget = persistentBackendTargetForSession(current);
+                if (backingTarget) {
+                  try {
+                    killPersistentBackendTarget(backingTarget, current.session.sessionId);
+                    const probe = probePersistentBackendTargetAfterKill(backingTarget);
+                    if (probe !== 'missing') {
+                      return { ok: false as const, code: 'error' as const, error: `backing ${backingType} session still present after stop (${probe}); refusing to rewind` };
+                    }
+                  } catch (err) {
+                    return asError(err, 'could not verify backing session is stopped');
+                  }
+                }
+              }
+              // Inside the try: if the file vanished after the CLI was stopped,
+              // this must surface as a failure reply, not escape to the
+              // log-only top-level catch while the session is already cold.
+              if (!await waitForTranscriptQuiet(rewindJsonl)) {
+                return { ok: false as const, code: 'error' as const, error: 'transcript is still being written' };
+              }
+              // Re-resolve the target by identity: the file may have gained a turn
+              // between preview and confirm, which shifts every index.
+              const target = findCheckpoint(scanClaudeTranscriptCheckpoints(rewindJsonl, 50), pendingPreview.target);
+              // index must still match: a turn that landed after the preview would
+              // otherwise be removed silently along with the previewed ones.
+              if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
+                return { ok: false as const, code: 'moved' as const };
+              }
+              // Persist replay-state clearing BEFORE the cut: if this throws
+              // (sqlite busy, disk full), nothing has been truncated and the
+              // live session keeps its previous /retry state.
+              const savedReplay = {
+                lastUserPrompt: current.session.lastUserPrompt,
+                lastCliInput: current.session.lastCliInput,
+                lastFailedTurn: current.session.lastFailedTurn,
+              };
+              current.session.lastUserPrompt = undefined;
+              current.session.lastCliInput = undefined;
+              current.session.lastFailedTurn = undefined;
+              try {
+                sessionStore.updateSession(current.session);
+              } catch (err) {
+                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
+                current.session.lastCliInput = savedReplay.lastCliInput;
+                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
+                return asError(err, 'could not persist rewind state');
+              }
+              let result: RewindResult;
+              try {
+                result = rewindClaudeTranscript(rewindJsonl, target.offset);
+              } catch (err) {
+                // Cut never happened — restore the replay fields so the failed
+                // attempt leaves the session as it was.
+                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
+                current.session.lastCliInput = savedReplay.lastCliInput;
+                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
+                try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
+                return asError(err);
+              }
+              // The CLI will cold-resume from the truncated transcript under the SAME
+              // native session id, so group-context coverage still marks the dropped
+              // turn's background as delivered and it is not re-injected.
+              //
+              // Post-cut cleanup is best-effort. The rewind itself is durable
+              // (backup + truncate already landed): reporting "failed" here would
+              // invite a retry against the already-truncated file and hide the
+              // backup path. Interrupted-turn journal offsets point into the
+              // removed tail; if removal fails, surface it as a warning, not an
+              // error. The next worker's restore treats a stale/missing journal
+              // conservatively (skip + notice).
+              let cleanupError: string | undefined;
+              try {
+                clearBridgeTurnJournal(join(config.session.dataDir, 'turn-marks', `${current.session.sessionId}.json`));
+              } catch (err) {
+                cleanupError = err instanceof Error ? err.message : String(err);
+                logger.warn(`[${logTag}] /rewind truncation succeeded but interrupted-turn journal cleanup failed: ${cleanupError}`);
+              }
+              return {
+                ok: true as const,
+                ...result,
+                ...(cleanupError ? { cleanupError } : {}),
+              };
+            } catch (err) {
+              return asError(err);
+            }
+          });
+          if (!rewindOutcome.ok) {
+            if (rewindOutcome.code === 'gone') await replyNoSession(replyHere, loc);
+            else if (rewindOutcome.code === 'busy') await sessionReply(rootId, t('cmd.rewind.busy', undefined, loc));
+            else if (rewindOutcome.code === 'moved') await sessionReply(rootId, t('cmd.rewind.moved', undefined, loc));
+            else await sessionReply(rootId, t('cmd.rewind.failed', { error: rewindOutcome.error ?? 'unknown' }, loc));
+            break;
           }
-        });
-        if (!rewindOutcome.ok) {
-          if (rewindOutcome.code === 'gone') await replyNoSession(replyHere, loc);
-          else if (rewindOutcome.code === 'busy') await sessionReply(rootId, t('cmd.rewind.busy', undefined, loc));
-          else if (rewindOutcome.code === 'moved') await sessionReply(rootId, t('cmd.rewind.moved', undefined, loc));
-          else await sessionReply(rootId, t('cmd.rewind.failed', { error: rewindOutcome.error ?? 'unknown' }, loc));
-          break;
+          logger.info(
+            `[${logTag}] /rewind rolled back to checkpoint ${rewindIndex}, removed ${rewindOutcome.removedBytes} bytes, backup ${rewindOutcome.backupPath}`,
+          );
+          await sessionReply(rootId, rewindOutcome.cleanupError
+            ? t('cmd.rewind.done_cleanup_warn', {
+              turns: rewindIndex,
+              bytes: rewindOutcome.removedBytes,
+              backup: rewindOutcome.backupPath,
+              error: rewindOutcome.cleanupError,
+            }, loc)
+            : t('cmd.rewind.done', {
+              turns: rewindIndex,
+              bytes: rewindOutcome.removedBytes,
+              backup: rewindOutcome.backupPath,
+            }, loc));
+        } catch (err) {
+          const errorText = err instanceof Error ? err.message : String(err);
+          const errnoCode = (err as NodeJS.ErrnoException | null)?.code;
+          // The resolved path can disappear between resolving and scanning
+          // (/clear rotation, scratch-tree reclaim, rename).
+          await sessionReply(rootId, errnoCode === 'ENOENT'
+            ? t('cmd.rewind.no_transcript', undefined, loc)
+            : t('cmd.rewind.failed', { error: errorText }, loc));
         }
-        logger.info(
-          `[${logTag}] /rewind rolled back to checkpoint ${rewindIndex}, removed ${rewindOutcome.removedBytes} bytes, backup ${rewindOutcome.backupPath}`,
-        );
-        await sessionReply(rootId, t('cmd.rewind.done', {
-          turns: rewindIndex,
-          bytes: rewindOutcome.removedBytes,
-          backup: rewindOutcome.backupPath,
-        }, loc));
         break;
       }
 

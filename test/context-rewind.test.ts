@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -106,6 +106,16 @@ describe('resumable', () => {
     const path = fixture([meta, userTurn('第一轮', 'u1'), assistant, userTurn('第二轮', 'u2')]);
     expect(scanClaudeTranscriptCheckpoints(path).map(cp => [cp.uuid, cp.resumable])).toEqual([['u2', true], ['u1', false]]);
   });
+
+  it('嵌套记录里的 "type":"assistant" 不会把第一轮标成可恢复（fail-closed）', () => {
+    // attachment 等嵌套对象的 type 字段在 JSON 文本里同样带真引号；廉价子串闸
+    // 若直接翻 sawConversation，就会允许截断到只剩元数据行（--resume 必然失败）。
+    const nested = { type: 'attachment', attachment: { type: 'assistant', text: 'lookalike' } };
+    const meta = { type: 'permission-mode', permissionMode: 'default' };
+    const path = fixture([meta, nested, userTurn('第一轮', 'u1'), assistant]);
+    const cps = scanClaudeTranscriptCheckpoints(path);
+    expect(cps.map(cp => [cp.uuid, cp.resumable])).toEqual([['u1', false]]);
+  });
 });
 
 describe('findCheckpoint', () => {
@@ -170,6 +180,35 @@ describe('rewindClaudeTranscript 文件安全', () => {
     expect(statSync(path).size).toBe(before);
     expect(readFileSync(victim, 'utf8')).toBe(victimBefore);
     expect(existsSync(victim)).toBe(true);
+  });
+
+  it('源路径在描述符校验后被换成软链：备份与截断仍钉在原 inode，不读链接目标', () => {
+    // 沙盒 agent 可在备份瞬间 unlink 原文件并把路径换成指向宿主文件的软链。
+    // 备份只允许从已 O_NOFOLLOW 打开的源 fd 读：链接目标内容绝不能进 .bak。
+    const path = fixture([userTurn('第一轮', 'u1'), assistant, userTurn('第二轮', 'u2')]);
+    const victim = fixture([{ type: 'user', message: { role: 'user', content: 'HOST_SECRET_TOKEN' } }]);
+    const victimBefore = readFileSync(victim, 'utf8');
+    const aside = `${path}.moved-aside`;
+    const [latest] = scanClaudeTranscriptCheckpoints(path);
+    const result = rewindClaudeTranscript(
+      path,
+      latest!.offset,
+      Date.UTC(2026, 9, 31, 2, 0, 0),
+      {
+        beforeBackup: () => {
+          renameSync(path, aside);
+          symlinkSync(victim, path);
+        },
+      },
+    );
+    const backupText = readFileSync(result.backupPath, 'utf8');
+    expect(backupText).toContain('第二轮');
+    expect(backupText).not.toContain('HOST_SECRET_TOKEN');
+    // 链接目标没有被动过。
+    expect(readFileSync(victim, 'utf8')).toBe(victimBefore);
+    // 截断落在被钉住的原 inode（此刻挂在 aside 路径下）。
+    expect(statSync(aside).size).toBe(latest!.offset);
+    expect(readFileSync(aside, 'utf8')).not.toContain('第二轮');
   });
 });
 

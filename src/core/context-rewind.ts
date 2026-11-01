@@ -12,7 +12,7 @@
  * （groupContextEpoch），换新 id 会让整段群历史——包括想丢掉的那条——重新注入。
  */
 
-import { closeSync, constants as fsConstants, copyFileSync, fstatSync, ftruncateSync, lstatSync, openSync, readSync, statSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import {
   extractTurnStartText,
   isMeaningfulQueuedCommand,
@@ -43,7 +43,12 @@ export interface RewindCheckpoint {
 }
 
 const CHUNK_BYTES = 1 << 20;
+const BACKUP_COPY_CHUNK_BYTES = 1 << 20;
 const PREVIEW_CHARS = 60;
+
+/** `/rewind` 列表展示、也唯一接受的序号范围（新的在前，1 = 最近一轮）。
+ *  confirm 时另有更深的内部重扫，用来在序号漂移后按身份找回预览的轮次。 */
+export const REWIND_CHECKPOINT_LIMIT = 10;
 
 /** 从一条 `<user_message>` / `<botmux_*>` 注入口袋里剥出人真正说的话。 */
 export function summarizeUserText(text: string): string {
@@ -82,7 +87,26 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20): Rewin
   let sawConversation = false;
 
   const handleLine = (line: Buffer, offset: number) => {
-    if (!sawConversation && line.includes('"type":"assistant"')) sawConversation = true;
+    // Fail-CLOSED conversation gate. The substring match is only a cheap
+    // prefilter: a nested record such as
+    // `{"type":"attachment",...,"attachment":{"type":"assistant"}}` contains
+    // the same bytes without being a top-level assistant record. Flipping on
+    // the substring alone would mark a pre-conversation prefix as resumable,
+    // allowing a rewind that leaves only metadata rows — `claude --resume`
+    // then answers "No conversation found" and the worker mints a fresh native
+    // id, which re-injects the entire group context (the failure this command
+    // exists to avoid). Only a parsed top-level `assistant` record counts.
+    if (!sawConversation && line.includes('"type":"assistant"')) {
+      try {
+        const early: unknown = JSON.parse(line.toString('utf8'));
+        if (early && typeof early === 'object' && (early as TranscriptEvent).type === 'assistant') {
+          sawConversation = true;
+        }
+      } catch {
+        // Malformed line: leave the gate false — offering one checkpoint too
+        // few is safe; offering a non-resumable one is not.
+      }
+    }
     // Cheap gate: most lines are assistant/tool records.
     if (!line.includes('"type":"user"') && !line.includes('"type":"attachment"')
       && !line.includes('compact_boundary')) return;
@@ -161,23 +185,86 @@ export interface RewindResult {
  * 拒绝非行首偏移，避免把半行留在文件里导致 `--resume` 解析失败。
  *
  * 沙盒会话的 transcript 在 agent 可写的 BOT_HOME 下：拒绝符号链接（不跟随截断），
- * 备份用 COPYFILE_EXCL（目标已存在——包括 agent 预埋的同名链接——就失败，不写穿）。
+ * 备份目标用 O_EXCL|O_NOFOLLOW 创建（目标已存在——包括 agent 预埋的同名链接——就
+ * 失败，不写穿）。备份内容只从已经 lstat + O_NOFOLLOW 钉住的源描述符读取：路径在
+ * 打开之后被换成软链（unlink + symlink）也只会截断/备份原 inode，绝不沿路径重新
+ * 打开去读链接目标。
  */
 export function rewindClaudeTranscript(
   path: string,
   offset: number,
   now: number = Date.now(),
+  opts: {
+    /** Test seam: runs after the source descriptor was validated and opened
+     *  but before the backup is read from it. Lets the symlink-swap regression
+     *  replace the pathname deterministically mid-operation. */
+    beforeBackup?: () => void;
+  } = {},
 ): RewindResult {
   if (!lstatSync(path).isFile()) throw new Error(`refusing to rewind non-regular file ${path}`);
   const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
   try {
-    return rewindOpenTranscript(fd, path, offset, now);
+    return rewindOpenTranscript(fd, path, offset, now, opts);
   } finally {
     closeSync(fd);
   }
 }
 
-function rewindOpenTranscript(fd: number, path: string, offset: number, now: number): RewindResult {
+/** Copy `size` bytes from the ALREADY-VALIDATED source descriptor into a new
+ *  O_EXCL|O_NOFOLLOW regular file. Never reopens the source by path: under the
+ *  agent-writable sandbox data dir the pathname can be swapped to a symlink
+ *  between validation and use, and a path-based copy would then read whatever
+ *  the link points at (host data the daemon can read but the sandbox cannot)
+ *  into the agent-readable backup. */
+function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number): void {
+  const dstFd = openSync(
+    backupPath,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    if (!fstatSync(dstFd).isFile()) {
+      throw new Error(`refusing to write rewind backup to non-regular file ${backupPath}`);
+    }
+    const buf = Buffer.allocUnsafe(BACKUP_COPY_CHUNK_BYTES);
+    let copied = 0;
+    while (copied < size) {
+      // Positional reads against the pinned descriptor — the pathname is
+      // irrelevant from here on.
+      const n = readSync(srcFd, buf, 0, Math.min(buf.length, size - copied), copied);
+      if (n <= 0) throw new Error(`unexpected EOF while backing up transcript (${copied}/${size} bytes)`);
+      let written = 0;
+      while (written < n) {
+        const w = writeSync(dstFd, buf, written, n - written);
+        if (w <= 0) throw new Error('short write while creating rewind backup');
+        written += w;
+      }
+      copied += n;
+    }
+    if (copied !== size) throw new Error(`rewind backup size mismatch (${copied}/${size} bytes)`);
+    // The CLI is supposed to be dead; a growing source here means it is not.
+    // Refuse rather than back up or cut a moving file.
+    if (fstatSync(srcFd).size !== size) {
+      throw new Error(`transcript changed size while creating backup ${backupPath}`);
+    }
+    if (fstatSync(dstFd).size !== size) {
+      throw new Error(`rewind backup short write (${fstatSync(dstFd).size}/${size} bytes)`);
+    }
+  } catch (err) {
+    try { unlinkSync(backupPath); } catch { /* may not have been created */ }
+    throw err;
+  } finally {
+    closeSync(dstFd);
+  }
+}
+
+function rewindOpenTranscript(
+  fd: number,
+  path: string,
+  offset: number,
+  now: number,
+  opts: { beforeBackup?: () => void } = {},
+): RewindResult {
   const st = fstatSync(fd);
   if (!Number.isInteger(offset) || offset <= 0 || offset > st.size) {
     throw new Error(`invalid rewind offset ${offset} (file size ${st.size})`);
@@ -189,7 +276,8 @@ function rewindOpenTranscript(fd: number, path: string, offset: number, now: num
   }
   const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
   const backupPath = `${path}.rewind-${stamp}.bak`;
-  copyFileSync(path, backupPath, fsConstants.COPYFILE_EXCL);
+  opts.beforeBackup?.();
+  copyBackupFromDescriptor(fd, backupPath, st.size);
   ftruncateSync(fd, offset);
   return { backupPath, removedBytes: st.size - offset };
 }

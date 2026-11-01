@@ -72,6 +72,12 @@ vi.mock('../src/services/worktree-slug-ai.js', () => ({
 vi.mock('../src/core/persistent-backend.js', () => ({
   isRemoteBackendSession: vi.fn(() => false),
   resolvePairedSpawnBackendType: vi.fn(),
+  getSessionPersistentBackendType: vi.fn(() => backendState.backingType),
+  persistentBackendTargetForSession: vi.fn(() => (backendState.backingType
+    ? { backendType: backendState.backingType, sessionName: 'bmx-sess-rw' }
+    : undefined)),
+  killPersistentBackendTarget: vi.fn(() => { if (backendState.killThrows) throw new Error('tmux kill failed'); }),
+  probePersistentBackendTargetAfterKill: vi.fn(() => backendState.probe),
 }));
 vi.mock('../src/im/lark/card-builder.js', () => ({
   getCliDisplayName: vi.fn(() => 'Claude Code'),
@@ -118,10 +124,11 @@ vi.mock('../src/utils/timezone.js', () => ({ scheduleTimeZone: vi.fn() }));
 
 // vi.mock factories are hoisted above imports, so the shared fakes must be
 // created with vi.hoisted to be referenceable inside the factories.
-const { sendWorkerInput, forkWorker, rememberLastCliInput, suspendWorker, killWorker, rewindState } = vi.hoisted(() => ({
+const { sendWorkerInput, forkWorker, rememberLastCliInput, suspendWorker, killWorker, rewindState, backendState } = vi.hoisted(() => ({
   suspendWorker: vi.fn<(ds: any, reason?: string) => boolean>(),
   killWorker: vi.fn<(ds: any) => void>(),
   rewindState: { jsonl: '' as string },
+  backendState: { backingType: undefined as string | undefined, probe: 'missing' as string, killThrows: false },
   sendWorkerInput: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
   forkWorker: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
   rememberLastCliInput: vi.fn<(ds: any, userPrompt: string, cliInput: any, opts?: any) => void>(),
@@ -292,6 +299,7 @@ import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
 import { config } from '../src/config.js';
+import { updateSession } from '../src/services/session-store.js';
 
 const LARK_APP_ID = 'app-1';
 const ROOT_ID = 'om_root_rw';
@@ -361,6 +369,9 @@ const remainingUserTexts = (path: string) => readFileSync(path, 'utf8').split('\
 beforeEach(() => {
   vi.clearAllMocks();
   resetPendingRewindPreviewsForTest();
+  backendState.backingType = undefined;
+  backendState.probe = 'missing';
+  backendState.killThrows = false;
   suspendWorker.mockImplementation((ds: any) => { ds.worker = null; return true; });
 });
 afterEach(() => {
@@ -466,4 +477,179 @@ describe('/rewind command', () => {
     expect(text).not.toContain('late');
     expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B']);
   }, 20_000);
+
+  it('预览后改发别的序号 confirm：拒绝（moved）且不截断', async () => {
+    rewindState.jsonl = transcript();
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind 1');
+    await run(deps, '/rewind 2 confirm');
+    expect(lastReply(deps)).toContain('找不到原来选中的那一轮');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B', 'C']);
+    expect(suspendWorker).not.toHaveBeenCalled();
+  });
+
+  it('suspend 返回 false（如 pty 后端）时 killWorker 兜底把 CLI 停掉', async () => {
+    rewindState.jsonl = transcript();
+    const worker = new FakeWorker();
+    const ds = makeDs('claude-code', worker);
+    const deps = makeDeps(ds);
+    await run(deps, '/rewind 1');
+    suspendWorker.mockImplementation(() => false);
+    killWorker.mockImplementation((d: any) => {
+      d.worker = null;
+      setTimeout(() => worker.exit(), 5);
+    });
+    try {
+      await run(deps, '/rewind 1 confirm');
+      expect(killWorker).toHaveBeenCalledTimes(1);
+      expect(lastReply(deps)).toContain('已回退');
+      expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B']);
+    } finally {
+      killWorker.mockReset();
+    }
+  });
+
+  it('停掉 CLI 后 transcript 消失：明确回报失败，不会零回复', async () => {
+    rewindState.jsonl = transcript();
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind 1');
+    suspendWorker.mockImplementation((d: any) => {
+      d.worker = null;
+      rmSync(rewindState.jsonl, { force: true });
+      return true;
+    });
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+  });
+
+  it('扫描时 transcript 已不存在：明确回复而不是静默', async () => {
+    rewindState.jsonl = transcript();
+    rmSync(rewindState.jsonl, { force: true });
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind');
+    expect(lastReply(deps)).toContain('找不到当前会话的 transcript');
+  });
+
+  it('截断前持久化 replay 状态失败：拒绝回退且文件不动', async () => {
+    rewindState.jsonl = transcript();
+    const ds = makeDs();
+    const deps = makeDeps(ds);
+    await run(deps, '/rewind 2');
+    updateSession.mockImplementationOnce(() => { throw new Error('sqlite busy'); });
+    await run(deps, '/rewind 2 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+    expect(lastReply(deps)).toContain('sqlite busy');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B', 'C']);
+    // In-memory replay fields were restored, so the failed attempt is invisible.
+    expect(ds.session.lastUserPrompt).toBe('C');
+  });
+
+  it('截断成功但中断轮日志删除失败：仍报完成并告警，文件确实截断', async () => {
+    rewindState.jsonl = transcript();
+    const ds = makeDs();
+    const deps = makeDeps(ds);
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-data-'));
+    dirs.push(dataDir);
+    (config.session as any).dataDir = dataDir;
+    const journalPath = join(dataDir, 'turn-marks', `${ds.session.sessionId}.json`);
+    // A directory in place of the journal file makes plain rmSync throw (EISDIR).
+    mkdirSync(journalPath, { recursive: true });
+
+    await run(deps, '/rewind 2');
+    await run(deps, '/rewind 2 confirm');
+    expect(lastReply(deps)).toContain('已回退');
+    expect(lastReply(deps)).toContain('日志清理失败');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A']);
+    expect(existsSync(journalPath)).toBe(true);
+  });
+
+  it('预览后会话又被 compact：锁内重扫发现目标落在压缩点之前，拒绝（moved）', async () => {
+    rewindState.jsonl = transcript();
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind 1');
+    suspendWorker.mockImplementation((d: any) => {
+      d.worker = null;
+      appendFileSync(rewindState.jsonl, line({ type: 'system', subtype: 'compact_boundary' }));
+      return true;
+    });
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('找不到原来选中的那一轮');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('预览后目标轮退化成第一轮（不可 resume）：锁内拒绝（moved）', async () => {
+    rewindState.jsonl = transcript();
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind 2');
+    suspendWorker.mockImplementation((d: any) => {
+      d.worker = null;
+      writeFileSync(rewindState.jsonl, [
+        { type: 'permission-mode', permissionMode: 'default' },
+        userTurn('B', 'uB'), assistant('b'),
+        userTurn('C', 'uC'), assistant('c'),
+      ].map(line).join(''));
+      return true;
+    });
+    await run(deps, '/rewind 2 confirm');
+    expect(lastReply(deps)).toContain('找不到原来选中的那一轮');
+  });
+
+  it('无 worker 但持久后端 pane 仍存活：探针非 missing 时拒绝截断', async () => {
+    rewindState.jsonl = transcript();
+    // worker-less session whose tmux pane survived (crash before lazy reattach).
+    const ds = makeDs('claude-code', null);
+    const deps = makeDeps(ds);
+    backendState.backingType = 'tmux';
+    backendState.probe = 'exists';
+    await run(deps, '/rewind 1');
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+    expect(lastReply(deps)).toContain('still present');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('无 worker 且持久后端探针不确定（unknown）：同样 fail-closed 拒绝', async () => {
+    rewindState.jsonl = transcript();
+    const ds = makeDs('claude-code', null);
+    const deps = makeDeps(ds);
+    backendState.backingType = 'tmux';
+    backendState.probe = 'unknown';
+    await run(deps, '/rewind 1');
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('无 worker 但持久后端确认已消失（missing）：正常完成回退', async () => {
+    rewindState.jsonl = transcript();
+    const ds = makeDs('claude-code', null);
+    const deps = makeDeps(ds);
+    backendState.backingType = 'tmux';
+    backendState.probe = 'missing';
+    await run(deps, '/rewind 2');
+    await run(deps, '/rewind 2 confirm');
+    expect(lastReply(deps)).toContain('已回退');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A']);
+  });
+
+  it('列表展示上限与可接受序号一致：15 轮只列、只接受 1–10', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-rewind-cmd-'));
+    dirs.push(dir);
+    const manyPath = join(dir, 'native.jsonl');
+    const rows: unknown[] = [{ type: 'permission-mode', permissionMode: 'default' }];
+    for (let i = 1; i <= 15; i += 1) {
+      rows.push(userTurn(`T${i}`, `uT${i}`), assistant(`r${i}`));
+    }
+    writeFileSync(manyPath, rows.map(line).join(''));
+    rewindState.jsonl = manyPath;
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind');
+    expect(lastReply(deps)).toContain('最近 10 个检查点');
+    expect(lastReply(deps)).toContain('T6');
+    expect(lastReply(deps)).not.toContain('T5');
+    await run(deps, '/rewind 15');
+    expect(lastReply(deps)).toContain('1–10');
+    await run(deps, '/rewind 10');
+    expect(lastReply(deps)).toContain('回复 `/rewind 10 confirm` 执行');
+  });
 });
