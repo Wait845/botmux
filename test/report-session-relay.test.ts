@@ -851,11 +851,19 @@ describe('report relay fallback (#2262)', () => {
       .toEqual({ ok: false, status: 400, error: 'relay_fallback_requires_relay' });
   });
 
-  it('treats a registry miss as a failure only for a named dispatch root', () => {
-    expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw({ explicitDispatchRoot: true }))).toBe(true);
-    expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw())).toBe(false);
-    expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw({ relayFallback: undefined, explicitDispatchRoot: true })))
-      .toBe(false);
+  it('publishes a registry miss for any proven dispatch topic, named or auto-inferred', () => {
+    const none = { dispatchKickoffBound: false };
+    const bound = { dispatchKickoffBound: true };
+    expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw({ explicitDispatchRoot: true }), none)).toBe(true);
+    // Auto-inferred root: same outcome as a named one once the daemon holds a
+    // bound dispatch kickoff for this topic.
+    expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw(), bound)).toBe(true);
+    // Neither: an ordinary topic, reported there by the CLI.
+    expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw(), none)).toBe(false);
+    for (const evidence of [none, bound]) {
+      expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw({ relayFallback: undefined, explicitDispatchRoot: true }), evidence))
+        .toBe(false);
+    }
   });
 
   it('leads the visible report with the undelivered reason and keeps the report intact', () => {

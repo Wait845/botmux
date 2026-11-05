@@ -262,3 +262,24 @@ export async function dispatchTurnProtocolContextForInbound(input: {
   }
 }
 
+/**
+ * Whether a registered-dispatch kickoff addressed to `appId` was posted into
+ * this topic (a signed, bound protocol record exists). Records are only bound
+ * for roots that had a verified registry binding at send time, so this is
+ * daemon-side proof that the topic is a dispatch topic even after its registry
+ * entry is gone — independent of whether the reporting CLI named the root.
+ */
+export function hasBoundDispatchKickoff(input: {
+  dataDir: string;
+  secret: string;
+  appId: string;
+  chatId: string;
+  rootId: string;
+}): boolean {
+  return Object.entries(readStore(input.dataDir)).some(([key, raw]) => {
+    if (key.startsWith('pending:')) return false;
+    const p = verify(input.secret, raw);
+    return !!p && p.messageId === key && p.chatId === input.chatId
+      && p.rootId === input.rootId && p.targetAppIds.includes(input.appId);
+  });
+}

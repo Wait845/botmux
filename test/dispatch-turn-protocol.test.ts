@@ -9,6 +9,7 @@ import {
   deliverWithDispatchTurnProtocol,
   dispatchTurnProtocolContextForInbound,
   dispatchTurnProtocolStorePath,
+  hasBoundDispatchKickoff,
   resolveDispatchTurnProtocol,
   selectDispatchKickoffContent,
   type DispatchTurnProtocolRequest,
@@ -165,3 +166,28 @@ describe('report protocol only for registered dispatch roots', () => {
   });
 });
 
+describe('bound dispatch kickoff as proof of a dispatch topic', () => {
+  const proof = (overrides: Partial<Parameters<typeof hasBoundDispatchKickoff>[0]> = {}) => hasBoundDispatchKickoff({
+    dataDir, secret, appId: 'cli_worker', chatId: 'oc_task', rootId: 'om_root', ...overrides });
+
+  it('is true only for a bound kickoff into this topic for this bot', async () => {
+    expect(proof()).toBe(false);
+    await deliver(async () => 'om_kickoff');
+    expect(proof()).toBe(true);
+    expect(proof({ appId: 'cli_bystander' })).toBe(false);
+    expect(proof({ rootId: 'om_other' })).toBe(false);
+    expect(proof({ chatId: 'oc_other' })).toBe(false);
+    expect(proof({ secret: 'other-secret' })).toBe(false);
+  });
+
+  it('does not count a pending (never posted) kickoff', async () => {
+    await expect(deliver(async () => { throw new Error('reply failed'); })).rejects.toThrow();
+    let release!: (id: string) => void;
+    const sending = deliver(() => new Promise<string>(resolve => { release = resolve; }));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(proof()).toBe(false);
+    release('om_kickoff');
+    await sending;
+    expect(proof()).toBe(true);
+  });
+});

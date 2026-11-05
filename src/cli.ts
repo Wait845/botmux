@@ -15779,8 +15779,9 @@ async function cmdReport(rest: string[]): Promise<void> {
           ...(reportDelivery !== 'relay' ? { delivery: reportDelivery } : {}),
           ...(publishTo ? { publishTo } : {}),
           // #2262: if the orchestrator provably never gets the relay, publish it
-          // in this dispatch thread instead of losing it. Only a named root makes
-          // a registry miss a failure; an implicit miss is an ordinary report.
+          // in this dispatch thread instead of losing it. A named root asserts a
+          // dispatch; for an implicit root the daemon decides from its own
+          // evidence (a bound dispatch kickoff in this topic).
           ...(reportDelivery === 'relay' ? {
             relayFallback: 'publish',
             ...(explicitDispatchRoot ? { explicitDispatchRoot: true } : {}),
@@ -15795,11 +15796,11 @@ async function cmdReport(rest: string[]): Promise<void> {
     const relayFallback = reportDelivery === 'relay'
       && triggerBody?.relayFallback && typeof triggerBody.relayFallback === 'object'
       ? triggerBody.relayFallback : undefined;
-    if (response.status === 404
-      && triggerBody?.error === 'dispatch_target_unavailable'
-      && !explicitDispatchRoot) {
-      // Ordinary topic/chat turn, not a registered dispatch.
-    } else if (relayFallback) {
+    // Order matters: a relayFallback object means the daemon judged this a
+    // dispatch topic (named root, or a bound dispatch kickoff in this topic) and
+    // attempted the marked card. Its outcome is final — success, or a hard
+    // failure — and must never fall through to an ordinary @ report here.
+    if (relayFallback) {
       const relayFailure = {
         reason: relayFallback.reason,
         status: relayFallback.relayStatus,
@@ -15847,6 +15848,10 @@ async function cmdReport(rest: string[]): Promise<void> {
         publicationTarget,
       }));
       return;
+    } else if (response.status === 404
+      && triggerBody?.error === 'dispatch_target_unavailable'
+      && !explicitDispatchRoot) {
+      // Ordinary topic/chat turn, not a dispatch: placed below as a normal report.
     } else if (!response.ok || triggerBody?.ok !== true) {
       console.error(JSON.stringify({ success: false, error: triggerBody?.error ?? `HTTP ${response.status}`,
         ...(triggerBody?.publishedMessageId ? { publishedMessageId: triggerBody.publishedMessageId } : {}),

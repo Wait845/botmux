@@ -20,7 +20,7 @@ import { deliverPublishedReport, type ReportDeliveryResponse } from './core/repo
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
-import { deliverWithDispatchTurnProtocol, dispatchTurnProtocolContextForInbound, selectDispatchKickoffContent } from './core/dispatch-turn-protocol.js';
+import { deliverWithDispatchTurnProtocol, dispatchTurnProtocolContextForInbound, hasBoundDispatchKickoff, selectDispatchKickoffContent } from './core/dispatch-turn-protocol.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
@@ -8945,6 +8945,22 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   return jsonRes(res, ok ? 200 : 409, { ok, ...(error ? { error } : !ok ? { error: 'not_found_or_denied' } : {}) });
 });
 
+/** Daemon-side proof that a report's root is a dispatch topic for this session's bot. */
+function reportRootHasBoundDispatchKickoff(ds: DaemonSession | undefined, raw: unknown): boolean {
+  const root = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).dispatchRoot : undefined;
+  if (!ds || typeof root !== 'string' || !ds.chatId) return false;
+  try {
+    return hasBoundDispatchKickoff({
+      dataDir: config.session.dataDir,
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+      appId: ds.larkAppId, chatId: ds.chatId, rootId: root.trim(),
+    });
+  } catch {
+    return false;
+  }
+}
+
 ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   let raw: unknown;
   try {
@@ -9072,7 +9088,9 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   };
 
   if (!decision.ok) {
-    if (decision.error === 'dispatch_target_unavailable' && wantsReportRelayFallbackOnMissingTarget(raw)) {
+    if (decision.error === 'dispatch_target_unavailable' && wantsReportRelayFallbackOnMissingTarget(raw, {
+      dispatchKickoffBound: reportRootHasBoundDispatchKickoff(ds, raw),
+    })) {
       return publishRelayFallback('dispatch_target_gone',
         { status: decision.status, body: { ok: false, error: decision.error } },
         async () => ({ projectSynced: false }));

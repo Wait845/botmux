@@ -38,6 +38,8 @@ import { createDispatchReportBinding, dispatchReportBindingSecretPath } from '..
 import { loadOrCreateDashboardSecret } from '../src/dashboard/auth.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 import { UNDELIVERED_REPORT_RELAY_REASON_TEXT } from '../src/core/report-session-relay.js';
+import { deliverWithDispatchTurnProtocol } from '../src/core/dispatch-turn-protocol.js';
+import { loadOrCreateDispatchReportBindingSecret } from '../src/core/dispatch-report-binding.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
@@ -174,6 +176,54 @@ describe('botmux report relay fallback, CLI to daemon (#2262)', () => {
     expect(mocks.reply).toHaveBeenCalledTimes(1);
     expect(mocks.fetch).not.toHaveBeenCalled();
   });
+
+  // A dispatch kickoff into ROOT that this daemon posted and bound (the hidden
+  // completion protocol record) — daemon-side proof that ROOT is a dispatch topic.
+  const bindKickoff = () => deliverWithDispatchTurnProtocol({
+    dataDir: data, secret: loadOrCreateDispatchReportBindingSecret(data),
+    sourceAppId: 'cli_lead', chatId: CHAT, rootId: ROOT, targetAppIds: [APP],
+    protocol: { dispatchRoot: ROOT, resultDelivery: 'relay', sameTopicSendEnabled: false },
+    send: async () => 'om_kickoff',
+  });
+
+  it('treats an auto-inferred root exactly like a named one: marked card in the dispatch topic', async () => {
+    writeFileSync(join(data, 'orchestrate-dispatch.json'), '{}');
+    await bindKickoff();
+    const result = await runReport(['Done']);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toMatchObject({ relayDelivered: false, placementSource: 'relay-fallback',
+      relayFailure: { reason: 'dispatch_target_gone' },
+      publicationTarget: { mode: 'thread', rootMessageId: ROOT, chatId: CHAT } });
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(mocks.reply.mock.calls[0]![1]).toBe(ROOT);
+    expect(mocks.reply.mock.calls[0]![2]).toContain('未送达主编排');
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(result.cliWrites).toEqual([]);
+  }, 90_000);
+
+  it.each([[['--dispatch-root', ROOT, 'Done']], [['Done']]])(
+    'fails non-zero with the reason, never a top-level post, when the marked card is blocked (%j)', async args => {
+      writeFileSync(join(data, 'orchestrate-dispatch.json'), '{}');
+      await bindKickoff();
+      getBot(APP).config.privateCard = true;
+      const result = await runReport(args);
+      expect(result.status).toBe(1);
+      expect(result.failure).toMatchObject({ success: false, error: 'dispatch_target_unavailable',
+        relayFailure: { reason: 'dispatch_target_gone' }, publicationBlockedBy: 'private_card' });
+      expect(mocks.reply).not.toHaveBeenCalled();
+      expect(mocks.send).not.toHaveBeenCalled();
+      expect(result.cliWrites).toEqual([]);
+      getBot(APP).config.privateCard = false;
+    }, 90_000);
+
+  it('fails non-zero for a named root whose session is not in that topic, without posting anywhere', async () => {
+    writeFileSync(join(data, 'orchestrate-dispatch.json'), '{}');
+    const result = await runReport(['--dispatch-root', 'om_watched_elsewhere', 'Done']);
+    expect(result.status).toBe(1);
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(result.cliWrites).toEqual([]);
+  }, 90_000);
 
   it('fails with the reason instead of publishing for a private-card bot', async () => {
     getBot(APP).config.privateCard = true;

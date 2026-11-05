@@ -379,13 +379,21 @@ export function authorizeReportRelayFallbackPublication(
   };
 }
 
-/** Whether a registry miss should publish instead of failing: only when the
- * caller named the dispatch root. An implicit candidate miss is an ordinary
- * report, which the CLI places itself. */
-export function wantsReportRelayFallbackOnMissingTarget(raw: unknown): boolean {
+/** Whether a registry miss should publish the marked card instead of failing.
+ *
+ * The topic is a dispatch topic when the caller named the root (`--dispatch-root`,
+ * copied from a dispatch brief) OR the daemon holds a signed kickoff bound into
+ * this exact topic for this bot. The second leg makes an auto-inferred root
+ * behave exactly like a named one. A miss with neither is an ordinary topic
+ * (e.g. a same-topic handoff), which the CLI reports there itself. */
+export function wantsReportRelayFallbackOnMissingTarget(
+  raw: unknown,
+  evidence: { dispatchKickoffBound: boolean },
+): boolean {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
   const body = raw as Record<string, unknown>;
-  return body.relayFallback === 'publish' && body.explicitDispatchRoot === true;
+  return body.relayFallback === 'publish'
+    && (body.explicitDispatchRoot === true || evidence.dispatchKickoffBound);
 }
 
 export function buildRelayFallbackReportMarkdown(
