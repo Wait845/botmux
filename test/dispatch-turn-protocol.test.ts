@@ -3,13 +3,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildDispatchCompletionBrief } from '../src/core/dispatch.js';
-import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
+import { createDispatchReportBinding, dispatchRootRegistration } from '../src/core/dispatch-report-binding.js';
 import { authorizeReportSessionRelayRequest } from '../src/core/report-session-relay.js';
 import {
   deliverWithDispatchTurnProtocol,
   dispatchTurnProtocolContextForInbound,
   dispatchTurnProtocolStorePath,
   resolveDispatchTurnProtocol,
+  selectDispatchKickoffContent,
   type DispatchTurnProtocolRequest,
 } from '../src/core/dispatch-turn-protocol.js';
 
@@ -122,3 +123,45 @@ describe('dispatch completion protocol as hidden turn context', () => {
       target: { larkAppId: 'cli_source', sessionId: 'session-source' } });
   });
 });
+
+describe('report protocol only for registered dispatch roots', () => {
+  const registry = (entries: Record<string, unknown>) =>
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify(entries));
+  const binding = (root: string, key = secret) => ({ orchAppId: 'cli_source', orchSessionId: 'session-source',
+    reportBinding: createDispatchReportBinding(key, { dispatchRoot: root, targetLarkAppId: 'cli_source',
+      targetSessionId: 'session-source', sourceName: 'task', issuedAt: '2026-11-06T00:00:00.000Z' }) });
+  const registration = (root: string) => dispatchRootRegistration({ dataDir, dispatchRoot: root, secret });
+
+  it('classifies registered, missing, forged and unreadable registries', () => {
+    expect(registration('om_root')).toBe('unregistered'); // no registry file at all
+    registry({ om_root: binding('om_root'), om_forged: binding('om_forged', 'other-secret') });
+    expect(registration('om_root')).toBe('registered');
+    // A secretary watch / human-started topic never gets an entry.
+    expect(registration('om_watched_topic')).toBe('unregistered');
+    expect(registration('om_forged')).toBe('unregistered');
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), '{ torn');
+    expect(registration('om_root')).toBe('unknown');
+  });
+
+  const inline = 'brief + — 完成回报 — footer';
+  const visible = 'brief only';
+  const body = { rootId: 'om_root', content: inline, visibleContent: visible, targetAppIds: ['cli_worker'] };
+
+  it('drops the protocol entirely for an unregistered root (hidden or inline request)', () => {
+    expect(selectDispatchKickoffContent({ ...body, completionProtocol: relay }, false)).toEqual({ content: visible });
+    expect(selectDispatchKickoffContent(body, false)).toEqual({ content: visible });
+  });
+
+  it('keeps the protocol for a registered root: hidden when requested, inline otherwise', () => {
+    expect(selectDispatchKickoffContent({ ...body, completionProtocol: relay }, true))
+      .toEqual({ content: visible, protocol: relay });
+    expect(selectDispatchKickoffContent(body, true)).toEqual({ content: inline });
+    expect(selectDispatchKickoffContent({ ...body, completionProtocol: { ...relay, dispatchRoot: 'om_other' } }, true))
+      .toEqual({ content: inline });
+  });
+
+  it('posts an older CLI body unchanged when it carries no brief-only copy', () => {
+    expect(selectDispatchKickoffContent({ rootId: 'om_root', content: inline }, false)).toEqual({ content: inline });
+  });
+});
+

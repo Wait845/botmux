@@ -110,7 +110,7 @@ function run(
       hooks.duringLookup?.();
       return 'oc_target';
     },
-    sendMessage, replyMessage, selectDispatchKickoffContent, deliverWithDispatchTurnProtocol,
+    sendMessage, replyMessage, selectDispatchKickoffContent, deliverWithDispatchTurnProtocol, isRegisteredDispatchRoot: () => true,
     loadOrCreateDispatchReportBindingSecret: () => 'secret',
     createDispatchReportBinding: () => ({}),
     recordDispatchRegistryEntry: async () => undefined,

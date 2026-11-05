@@ -112,10 +112,19 @@ export function dispatchTurnProtocolContext(protocol: DispatchTurnProtocolReques
 }
 
 /**
- * Pick what the source daemon posts for a delivery request. Only a complete,
- * well-formed hidden-protocol request bound to the same root switches to the
- * brief-only post; anything else posts `content` (inline footer) unchanged, so
- * a malformed or partial request can never silently drop the protocol.
+ * Pick what the source daemon posts for a delivery request.
+ *
+ * - The root is NOT a registered dispatch (`--into` a human-started topic, a
+ *   secretary watch, …): post the brief only, with no completion protocol at
+ *   all. A `--dispatch-root` instruction there names a root `botmux report`
+ *   can never resolve, and the legacy positional form would make the worker
+ *   post a top-level @ in the group. The topic's own conversation is the
+ *   report channel.
+ * - Registered root + complete hidden-protocol request: post the brief only
+ *   and bind the protocol as hidden turn context.
+ * - Anything else (older CLI, malformed/partial hidden request, legacy `--bot`
+ *   into a registered dispatch): post `content` with the inline footer, so a
+ *   bad request can never silently drop the protocol of a real dispatch.
  */
 export function selectDispatchKickoffContent(body: {
   rootId?: unknown;
@@ -123,17 +132,19 @@ export function selectDispatchKickoffContent(body: {
   visibleContent?: unknown;
   completionProtocol?: unknown;
   targetAppIds?: unknown;
-}): { content: string; protocol?: DispatchTurnProtocolRequest } {
+}, rootRegistered: boolean): { content: string; protocol?: DispatchTurnProtocolRequest } {
   const content = String(body.content ?? '');
-  if (body.completionProtocol === undefined) return { content };
+  const visible = typeof body.visibleContent === 'string' && body.visibleContent.trim()
+    ? body.visibleContent : undefined;
+  if (!rootRegistered && visible) return { content: visible };
+  if (body.completionProtocol === undefined || !visible) return { content };
   const parsed = dispatchTurnProtocolRequestSchema.safeParse(body.completionProtocol);
   if (!parsed.success
     || parsed.data.dispatchRoot !== body.rootId
-    || typeof body.visibleContent !== 'string' || !body.visibleContent.trim()
     || !Array.isArray(body.targetAppIds) || body.targetAppIds.length === 0) {
     return { content };
   }
-  return { content: body.visibleContent, protocol: parsed.data };
+  return { content: visible, protocol: parsed.data };
 }
 
 /**
@@ -250,3 +261,4 @@ export async function dispatchTurnProtocolContextForInbound(input: {
     return '';
   }
 }
+

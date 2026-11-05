@@ -517,6 +517,7 @@ import {
 import {
   createDispatchReportBinding,
   resolveVerifiedDispatchReportTarget,
+  dispatchRootRegistration,
   loadOrCreateDispatchReportBindingSecret,
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
@@ -4665,6 +4666,10 @@ function dispatchProtocolApplicationContext(larkAppId: string, chatId: string,
   });
 }
 
+function isRegisteredDispatchRoot(root: string, secret: string): boolean {
+  return dispatchRootRegistration({ dataDir: config.session.dataDir, dispatchRoot: root, secret }) !== 'unregistered';
+}
+
 /** Only an authenticated dispatch can shed the protocol appended by our CLI. */
 function zeroPromptTaskContent(content: string, larkAppId: string, dispatchRoot?: string, frozen?: PromptInjection): string {
   if (!zeroPromptInjectionForBot(larkAppId, undefined, frozen) || !dispatchRoot) return content;
@@ -8125,12 +8130,14 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     // to the posted message id and injected into the target's turn as hidden
     // context (core/dispatch-turn-protocol.ts). Without the signing secret the
     // hidden lane is unavailable, so post the inline footer instead of losing it.
-    let kickoff = selectDispatchKickoffContent(body);
+    // A completion protocol names a report destination, so it is only emitted
+    // for a root `botmux report` can resolve: a signed registry binding.
     let protocolSecret: string | undefined;
-    if (kickoff.protocol) {
-      try { protocolSecret = loadOrCreateDispatchReportBindingSecret(config.session.dataDir); }
-      catch { kickoff = { content: body.content }; }
-    }
+    try { protocolSecret = loadOrCreateDispatchReportBindingSecret(config.session.dataDir); }
+    catch { /* unknown registration: keep the inline footer below */ }
+    const kickoff = protocolSecret === undefined
+      ? { content: String(body.content) } as ReturnType<typeof selectDispatchKickoffContent>
+      : selectDispatchKickoffContent(body, isRegisteredDispatchRoot(rootId, protocolSecret));
     const post = () => replyMessage(ds.larkAppId, rootId, kickoff.content, 'post', true, undefined, undefined, sourceWriteOptions);
     const protocol = kickoff.protocol;
     const send = protocol && protocolSecret

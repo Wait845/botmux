@@ -71,7 +71,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
-    selectDispatchKickoffContent, deliverWithDispatchTurnProtocol,
+    selectDispatchKickoffContent, deliverWithDispatchTurnProtocol, isRegisteredDispatchRoot: () => true,
     config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
     logger: { info: vi.fn() },
   };
@@ -535,6 +535,26 @@ describe('dispatch delivery hides the completion protocol from the topic', () =>
     expect(h.send).toHaveBeenCalledWith('cli_source', 'om_root', inline, 'post', true,
       undefined, undefined, expect.anything());
     expect(await boundProtocol()).toBeUndefined();
+  });
+
+  it.each(['hidden', 'legacy-inline'] as const)('posts the brief with no protocol into a root that is not a registered dispatch (%s)', async kind => {
+    const h = harness({ content: inline, visibleContent: visible,
+      ...(kind === 'hidden' ? { completionProtocol: protocol } : {}) });
+    h.scope.getBot = () => ({ config: {} });
+    h.scope.isRegisteredDispatchRoot = vi.fn(() => false);
+    expect((await h.run()).status).toBe(200);
+    expect(h.scope.isRegisteredDispatchRoot).toHaveBeenCalledWith('om_root', secret);
+    expect(h.send).toHaveBeenCalledExactlyOnceWith('cli_source', 'om_root', visible, 'post', true,
+      undefined, undefined, expect.anything());
+    expect(await boundProtocol()).toBeUndefined();
+  });
+
+  it('keeps an older CLI body (no visible brief) unchanged for an unregistered root', async () => {
+    const h = harness({ content: inline });
+    h.scope.getBot = () => ({ config: {} });
+    h.scope.isRegisteredDispatchRoot = () => false;
+    expect((await h.run()).status).toBe(200);
+    expect(h.send).toHaveBeenCalledWith('cli_source', 'om_root', inline, 'post', true, undefined, undefined, expect.anything());
   });
 
   it('posts the inline footer when the signing secret is unavailable', async () => {

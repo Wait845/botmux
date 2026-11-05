@@ -151,9 +151,10 @@ export interface DispatchKickoffDelivery {
   /** Rich post with the completion protocol inline. An older source daemon
    *  that does not know the hidden lane posts this field as-is. */
   content: string;
-  /** Rich post carrying the brief only — what the topic shows when the
-   *  protocol travels as hidden turn context. */
-  visibleContent?: string;
+  /** Rich post carrying the brief only. The source daemon posts it when the
+   *  protocol travels as hidden turn context, or when the root is not a
+   *  registered dispatch (then there is no report destination to name). */
+  visibleContent: string;
   /** Structured protocol the source daemon binds to the posted message. */
   completionProtocol?: {
     dispatchRoot: string;
@@ -168,7 +169,9 @@ export interface DispatchKickoffDelivery {
  * Exact-root (`--bot-app`) dispatches target bots on this machine, whose
  * daemons share the data dir the hidden protocol is stored in, so the topic
  * shows the brief only. Legacy `--bot` dispatches may land on another machine
- * and keep the inline footer: there the message is the only channel.
+ * and keep the inline footer: there the message is the only channel. Either
+ * way the source daemon drops the protocol when the root is not a registered
+ * dispatch (`--into` an ordinary topic), see selectDispatchKickoffContent.
  */
 export function buildDispatchKickoffDelivery(input: {
   title: string;
@@ -183,10 +186,11 @@ export function buildDispatchKickoffDelivery(input: {
   const post = (brief: string): string => JSON.stringify({ zh_cn: { title: '',
     content: buildDispatchMessages({ title: input.title, brief, bots: input.bots }).threadContent } });
   const content = post(buildDispatchCompletionBrief({ ...input, resultDelivery }));
-  if (!input.exactReportRootEnabled) return { content };
+  const visibleContent = post(input.brief);
+  if (!input.exactReportRootEnabled) return { content, visibleContent };
   return {
     content,
-    visibleContent: post(input.brief),
+    visibleContent,
     completionProtocol: {
       dispatchRoot: input.dispatchRootId.trim(),
       resultDelivery,

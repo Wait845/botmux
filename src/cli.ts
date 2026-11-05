@@ -15124,10 +15124,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const delivery = kickoffDelivery(rootId);
     const response = await postCurrentSessionDaemonRoute({
       path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId, originClaim: dispatchOriginClaim,
-      body: { rootId, chatId: targetChatId, content: delivery.content,
-        ...(delivery.visibleContent && delivery.completionProtocol ? {
-          visibleContent: delivery.visibleContent, completionProtocol: delivery.completionProtocol,
-        } : {}),
+      body: { rootId, chatId: targetChatId, content: delivery.content, visibleContent: delivery.visibleContent,
+        ...(delivery.completionProtocol ? { completionProtocol: delivery.completionProtocol } : {}),
         targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0,
         ...(delegateScheduleCreate ? { delegateScheduleCreate: true } : {}),
         ...(suppressScheduleCreate ? { suppressScheduleCreate: true } : {}) },

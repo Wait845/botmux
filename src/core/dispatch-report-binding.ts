@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { lstatSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readSecureHostFileSync, withSecureHostParentSync } from '../platform/secure-host-file.js';
 
@@ -207,4 +207,31 @@ export function resolveVerifiedDispatchReportTarget(input: {
   return binding
     ? { ok: true, binding }
     : { ok: false, error: 'dispatch_binding_unproven' };
+}
+
+/**
+ * Whether `dispatchRoot` is a registered dispatch in `<dataDir>/orchestrate-dispatch.json`.
+ *
+ * - `registered`: a binding signed with the fleet secret exists.
+ * - `unregistered`: the registry was read and has no entry for this root, or
+ *   only an unverifiable one (a forged/foreign entry does not make it a dispatch).
+ * - `unknown`: the registry exists but could not be read or parsed. Callers
+ *   deciding whether to keep a report protocol treat this like `registered`
+ *   so a real dispatch never loses its instructions.
+ */
+export function dispatchRootRegistration(input: {
+  dataDir: string;
+  dispatchRoot: string;
+  secret: string;
+}): 'registered' | 'unregistered' | 'unknown' {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(input.dataDir, 'orchestrate-dispatch.json'), 'utf8'));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'ENOENT' ? 'unregistered' : 'unknown';
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'unknown';
+  return resolveVerifiedDispatchReportTarget({
+    registry: parsed as Record<string, unknown>, dispatchRoot: input.dispatchRoot, secret: input.secret,
+  }).ok ? 'registered' : 'unregistered';
 }

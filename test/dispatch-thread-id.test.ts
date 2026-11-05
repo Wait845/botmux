@@ -249,8 +249,10 @@ describe('kickoff completion protocol placement', () => {
     const h = harness(mode);
     await h.run();
     const body = deliveryBody(h);
-    expect(body.visibleContent).toBeUndefined();
+    // No hidden protocol: a registered root posts `content` (inline footer);
+    // the brief-only copy is used only when the root is not a dispatch at all.
     expect(body.completionProtocol).toBeUndefined();
+    expect(postText(body.visibleContent)).not.toContain('完成回报');
     expect(postText(body.content)).toContain('— 完成回报 —');
     expect(postText(body.content)).toContain('--legacy-dispatch');
   });
