@@ -147,6 +147,54 @@ export function buildDispatchCompletionBrief(input: {
     : withReport;
 }
 
+export interface DispatchKickoffDelivery {
+  /** Rich post with the completion protocol inline. An older source daemon
+   *  that does not know the hidden lane posts this field as-is. */
+  content: string;
+  /** Rich post carrying the brief only — what the topic shows when the
+   *  protocol travels as hidden turn context. */
+  visibleContent?: string;
+  /** Structured protocol the source daemon binds to the posted message. */
+  completionProtocol?: {
+    dispatchRoot: string;
+    resultDelivery: DispatchResultDelivery;
+    sameTopicSendEnabled: boolean;
+  };
+}
+
+/**
+ * Build the kickoff body sent to the source daemon's delivery route.
+ *
+ * Exact-root (`--bot-app`) dispatches target bots on this machine, whose
+ * daemons share the data dir the hidden protocol is stored in, so the topic
+ * shows the brief only. Legacy `--bot` dispatches may land on another machine
+ * and keep the inline footer: there the message is the only channel.
+ */
+export function buildDispatchKickoffDelivery(input: {
+  title: string;
+  brief: string;
+  bots: DispatchBot[];
+  dispatchRootId: string;
+  exactReportRootEnabled: boolean;
+  sameTopicSendEnabled: boolean;
+  resultDelivery?: DispatchResultDelivery;
+}): DispatchKickoffDelivery {
+  const resultDelivery = input.resultDelivery ?? 'relay';
+  const post = (brief: string): string => JSON.stringify({ zh_cn: { title: '',
+    content: buildDispatchMessages({ title: input.title, brief, bots: input.bots }).threadContent } });
+  const content = post(buildDispatchCompletionBrief({ ...input, resultDelivery }));
+  if (!input.exactReportRootEnabled) return { content };
+  return {
+    content,
+    visibleContent: post(input.brief),
+    completionProtocol: {
+      dispatchRoot: input.dispatchRootId.trim(),
+      resultDelivery,
+      sameTopicSendEnabled: input.sameTopicSendEnabled,
+    },
+  };
+}
+
 /** Remove only our exact generated suffix, after the receiver has verified the
  * dispatch binding. Never strip user-authored XML or arbitrary instructions. */
 export function stripDispatchCompletionProtocol(content: string, dispatchRoot: string): string {

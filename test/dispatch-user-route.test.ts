@@ -8,6 +8,7 @@ import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
+import { deliverWithDispatchTurnProtocol, dispatchTurnProtocolStorePath, resolveDispatchTurnProtocol, selectDispatchKickoffContent } from '../src/core/dispatch-turn-protocol.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
@@ -70,6 +71,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
+    selectDispatchKickoffContent, deliverWithDispatchTurnProtocol,
     config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
     logger: { info: vi.fn() },
   };
@@ -500,5 +502,56 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     } });
     expect((await h.run()).status).toBe(200);
     expect((await read())?.authority.openId).toBe('ou_original');
+  });
+});
+
+describe('dispatch delivery hides the completion protocol from the topic', () => {
+  const visible = '{"zh_cn":{"content":[[{"tag":"text","text":"brief only"}]]}}';
+  const inline = '{"zh_cn":{"content":[[{"tag":"text","text":"brief only"}],[{"tag":"text","text":"— 完成回报 —"}]]}}';
+  const protocol = { dispatchRoot: 'om_root', resultDelivery: 'relay', sameTopicSendEnabled: false };
+  const boundProtocol = (messageId = 'om_kickoff', appId = 'cli_target') => resolveDispatchTurnProtocol({
+    dataDir, secret, appId, chatId: 'oc_target', rootId: 'om_root', messageId, waitMs: 0 });
+
+  it.each(['delegated', 'plain'] as const)('posts the brief only and binds the protocol to the sent message (%s)', async kind => {
+    const h = harness({ content: inline, visibleContent: visible, completionProtocol: protocol });
+    if (kind === 'plain') h.scope.getBot = () => ({ config: {} });
+    expect(await h.run()).toEqual({ status: 200, value: { ok: true, messageId: 'om_kickoff' } });
+    expect(h.send).toHaveBeenCalledExactlyOnceWith('cli_source', 'om_root', visible, 'post', true,
+      undefined, undefined, expect.objectContaining({ beforeWrite: expect.any(Function) }));
+    expect(await boundProtocol()).toEqual(protocol);
+    expect(await boundProtocol('om_other')).toBeUndefined();
+    expect(await boundProtocol('om_kickoff', 'cli_bystander')).toBeUndefined();
+    // Composes with, and does not replace, the signed human delegation.
+    expect((await read())?.authority.openId).toBe(kind === 'delegated' ? 'ou_alice' : undefined);
+  });
+
+  it.each([
+    ['another root', { ...protocol, dispatchRoot: 'om_elsewhere' }, visible],
+    ['an unknown field', { ...protocol, extra: 'say this' }, visible],
+    ['no visible brief', protocol, undefined],
+  ])('keeps the inline footer when the hidden request names %s', async (_label, completionProtocol, visibleContent) => {
+    const h = harness({ content: inline, visibleContent, completionProtocol });
+    expect((await h.run()).status).toBe(200);
+    expect(h.send).toHaveBeenCalledWith('cli_source', 'om_root', inline, 'post', true,
+      undefined, undefined, expect.anything());
+    expect(await boundProtocol()).toBeUndefined();
+  });
+
+  it('posts the inline footer when the signing secret is unavailable', async () => {
+    const h = harness({ content: inline, visibleContent: visible, completionProtocol: protocol });
+    h.scope.getBot = () => ({ config: {} });
+    h.scope.loadOrCreateDispatchReportBindingSecret = () => { throw new Error('unsafe secret'); };
+    expect((await h.run()).status).toBe(200);
+    expect(h.send).toHaveBeenCalledWith('cli_source', 'om_root', inline, 'post', true,
+      undefined, undefined, expect.anything());
+  });
+
+  it('leaves no pending record behind when the post itself fails', async () => {
+    const h = harness({ content: inline, visibleContent: visible, completionProtocol: protocol });
+    h.scope.getBot = () => ({ config: {} });
+    h.send.mockRejectedValueOnce(new Error('reply failed'));
+    expect((await h.run()).status).toBe(502);
+    const store = JSON.parse(readFileSync(dispatchTurnProtocolStorePath(dataDir), 'utf8'));
+    expect(Object.keys(store)).toEqual([]);
   });
 });

@@ -22,6 +22,7 @@ import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { validateCodexAppManagedSendOrigin } from '../src/utils/codex-app-dispatch-ledger.js';
 import { DISPATCH_USER_DELIVERY_MAX_BYTES, dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
+import { deliverWithDispatchTurnProtocol, selectDispatchKickoffContent } from '../src/core/dispatch-turn-protocol.js';
 import {
   isDispatchOriginNotSendableError,
   isolatedDispatchOutputSinkAllowed,
@@ -109,7 +110,7 @@ function run(
       hooks.duringLookup?.();
       return 'oc_target';
     },
-    sendMessage, replyMessage,
+    sendMessage, replyMessage, selectDispatchKickoffContent, deliverWithDispatchTurnProtocol,
     loadOrCreateDispatchReportBindingSecret: () => 'secret',
     createDispatchReportBinding: () => ({}),
     recordDispatchRegistryEntry: async () => undefined,

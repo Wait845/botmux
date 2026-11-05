@@ -1638,7 +1638,7 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 **简报必须写清子 bot 的「完成协议」**，否则收不齐：
 - 你的飞书任务 ID 是 <task_guid>；
 - 干完用 **lark-task** 把该任务标记完成、并把产出（链接/摘要）挂到任务评论或附件；
-- 然后用 \`botmux report "子项目X 完成 + 产出位置"\` 回报（**别在本话题 @ 主bot**——会另起一个无上下文的新会话；\`botmux dispatch\` 已把这条「完成回报」协议自动追加进简报，子 bot 照做即可）；
+- 然后用 \`botmux report "子项目X 完成 + 产出位置"\` 回报（**别在本话题 @ 主bot**——会另起一个无上下文的新会话；\`botmux dispatch --bot-app\` 会把这条「完成回报」协议作为隐藏上下文随派单注入（话题里不显示；旧式 \`--bot\` 派单仍附在简报末尾），子 bot 照做即可）；
 - coder 写完先 @ reviewer 在本话题 review，过了再标完成。
 
 > repo 预设：\`--repo\` 让子 bot 起会话直接进该目录、免手点「选仓库」卡。注意**跨 owner 的 repo 预设可能受授权限制**——若子 bot 已配 defaultWorkingDir，可省略 \`--repo\`。

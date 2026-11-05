@@ -15,8 +15,11 @@ export const SCHEDULE_MANAGED_MUTATE_ROUTE = '/api/schedule/managed-mutate';
  *  itself, so the daemon signs the delegation in two steps around that write. */
 export const DISPATCH_USER_MENTION_PREPARE_ROUTE = '/api/dispatch-user/mention-prepare';
 export const DISPATCH_USER_MENTION_BIND_ROUTE = '/api/dispatch-user/mention-bind';
-/** Limit the complete UTF-8 JSON request, including routing and encoded brief. */
-export const DISPATCH_USER_DELIVERY_MAX_BYTES = 64 * 1024;
+/** Limit the complete UTF-8 JSON request, including routing and encoded brief.
+ *  An exact-root kickoff carries the brief twice (`content` with the inline
+ *  completion footer for older daemons, `visibleContent` without it), so the
+ *  cap is twice the single-brief budget it historically had. */
+export const DISPATCH_USER_DELIVERY_MAX_BYTES = 128 * 1024;
 const identity = (prefix: string) => z.string().regex(new RegExp(`^${prefix}[A-Za-z0-9_-]{1,128}$`));
 const authorityV1Schema = z.object({
   appId: identity('cli_'),

@@ -20,6 +20,7 @@ import { deliverPublishedReport, type ReportDeliveryResponse } from './core/repo
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
+import { deliverWithDispatchTurnProtocol, dispatchTurnProtocolContextForInbound, selectDispatchKickoffContent } from './core/dispatch-turn-protocol.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
@@ -4653,6 +4654,17 @@ async function reportZeroPromptFinal(ds: DaemonSession, input: {
   });
 }
 
+/** The completion protocol a `botmux dispatch --bot-app` kickoff carries as
+ *  hidden turn context (the topic shows the brief only). '' for any other message. */
+function dispatchProtocolApplicationContext(larkAppId: string, chatId: string,
+  parsed: { messageId?: string; rootId?: string }, zeroInjection: boolean): Promise<string> {
+  return dispatchTurnProtocolContextForInbound({
+    dataDir: config.session.dataDir,
+    loadSecret: () => loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+    appId: larkAppId, chatId, rootId: parsed.rootId, messageId: parsed.messageId, zeroInjection,
+  });
+}
+
 /** Only an authenticated dispatch can shed the protocol appended by our CLI. */
 function zeroPromptTaskContent(content: string, larkAppId: string, dispatchRoot?: string, frozen?: PromptInjection): string {
   if (!zeroPromptInjectionForBot(larkAppId, undefined, frozen) || !dispatchRoot) return content;
@@ -8109,7 +8121,24 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       return jsonRes(res, 409, { ok: false, error: 'dispatch_turn_changed' });
     }
     await sourceWriteOptions.beforeWrite();
-    const send = () => replyMessage(ds.larkAppId, rootId, body.content, 'post', true, undefined, undefined, sourceWriteOptions);
+    // Exact-root kickoffs post the brief only; the completion protocol is bound
+    // to the posted message id and injected into the target's turn as hidden
+    // context (core/dispatch-turn-protocol.ts). Without the signing secret the
+    // hidden lane is unavailable, so post the inline footer instead of losing it.
+    let kickoff = selectDispatchKickoffContent(body);
+    let protocolSecret: string | undefined;
+    if (kickoff.protocol) {
+      try { protocolSecret = loadOrCreateDispatchReportBindingSecret(config.session.dataDir); }
+      catch { kickoff = { content: body.content }; }
+    }
+    const post = () => replyMessage(ds.larkAppId, rootId, kickoff.content, 'post', true, undefined, undefined, sourceWriteOptions);
+    const protocol = kickoff.protocol;
+    const send = protocol && protocolSecret
+      ? () => deliverWithDispatchTurnProtocol({
+          dataDir: config.session.dataDir, secret: protocolSecret!,
+          sourceAppId: ds.larkAppId, chatId, rootId, targetAppIds, protocol, send: post,
+        })
+      : post;
     const messageId = authority && turnId && targetAppIds.length
       ? await deliverDispatchWithUser({
           dataDir: config.session.dataDir,
@@ -25257,7 +25286,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const codexAppQuoteContext = ctx.forwardSeedData || zeroPromptInjectionForBot(larkAppId)
     ? ''
     : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId));
-  const codexAppApplicationContext = vcMeetingApplicationContext(ctx);
+  const codexAppApplicationContext = vcMeetingApplicationContext(ctx)
+    + await dispatchProtocolApplicationContext(larkAppId, chatId, parsed, zeroPromptInjectionForBot(larkAppId));
   // 普通群「对已有消息发起话题再 @」：入站是话题内回复（root_id 指向另一条更早
   // 的话题根消息），bot 从未留存该话题历史，且正文里没有任何信号表明存在话题根+
   // 前情。首轮注入一行 hint（非全文、零网络请求），提示 CLI 可用 `botmux history`
@@ -27370,7 +27400,8 @@ async function handleThreadReplyAdmitted(
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
   const initialCodexAppMessageContext = zeroInjection ? ''
     : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix;
-  const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
+  const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx)
+    + await dispatchProtocolApplicationContext(larkAppId, ctxChatId, parsed, zeroInjection);
   const initialPromptContent = zeroInjection
     ? zeroPromptTaskContent(stripCrossPrincipalAsToken(parsed.content).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
     : initialCodexAppMessageContext + initialCodexAppApplicationContext

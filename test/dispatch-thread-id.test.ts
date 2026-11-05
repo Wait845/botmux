@@ -5,7 +5,7 @@ import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
-import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
+import { buildDispatchCompletionBrief, buildDispatchKickoffDelivery, buildDispatchMessages, buildProjectDispatchSyncAction,
   buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget } from '../src/core/dispatch.js';
 
 function extract(path: string, names: string[]): string {
@@ -85,7 +85,7 @@ function harness(mode: Mode, options: {
     return controller.signal;
   });
   const state = {
-    parseDispatchArgs, buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
+    parseDispatchArgs, buildDispatchCompletionBrief, buildDispatchKickoffDelivery, buildDispatchMessages, buildProjectDispatchSyncAction,
     buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget, pickTurnReplyTarget,
     resolveSessionContext: () => undefined,
     process: { env: { SESSION_DATA_DIR: '/isolated/data' }, exitCode: 0,
@@ -219,4 +219,39 @@ it.each(['dispatch', 'into'] as const)('%s keeps acceptance timeout independent 
     accepted: false, acceptedBotAppIds: [], missingBotAppIds: ['cli_target'],
   });
   expect(h.state.process.exitCode).toBe(1);
+});
+
+describe('kickoff completion protocol placement', () => {
+  const deliveryBody = (h: ReturnType<typeof harness>) => {
+    const call = h.postCurrentSessionDaemonRoute.mock.calls
+      .map(([input]) => input as { path: string; body: any })
+      .find(input => input.path === '/api/dispatch-user/deliver');
+    if (!call) throw new Error('no delivery request');
+    return call.body;
+  };
+  const postText = (json: string) => JSON.parse(json).zh_cn.content.flat()
+    .map((node: { tag: string; text?: string }) => node.text ?? '').join('\n');
+
+  it.each(['dispatch', 'into'] as const)('%s --bot-app posts the brief only and hands the protocol over as hidden context', async mode => {
+    const h = harness(mode, { acceptance: 'accepted' });
+    await h.run();
+    const body = deliveryBody(h);
+    expect(postText(body.visibleContent)).toContain('完成任务');
+    expect(postText(body.visibleContent)).not.toContain('完成回报');
+    expect(postText(body.visibleContent)).not.toContain('botmux report');
+    expect(body.completionProtocol).toEqual({ dispatchRoot: h.root, resultDelivery: 'relay', sameTopicSendEnabled: false });
+    // An older source daemon ignores the new fields and posts `content`: the
+    // protocol must still be there, so a deploy skew never loses it.
+    expect(postText(body.content)).toContain(`botmux report --dispatch-root ${h.root}`);
+  });
+
+  it.each(['dispatch', 'into'] as const)('%s legacy --bot (possibly another machine) keeps the visible footer', async mode => {
+    const h = harness(mode);
+    await h.run();
+    const body = deliveryBody(h);
+    expect(body.visibleContent).toBeUndefined();
+    expect(body.completionProtocol).toBeUndefined();
+    expect(postText(body.content)).toContain('— 完成回报 —');
+    expect(postText(body.content)).toContain('--legacy-dispatch');
+  });
 });

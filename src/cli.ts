@@ -64,7 +64,7 @@ import {
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession, type TurnTerminalCarrierKind } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, foldableChatSessionAppIds, offTopicSubBotTopic, resolveProseBotMentions, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchKickoffDelivery, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, foldableChatSessionAppIds, offTopicSubBotTopic, resolveProseBotMentions, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
   persistDispatchLifecycle as persistDispatchLifecycleRecord,
   type DispatchAcceptanceState,
@@ -15012,18 +15012,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const { readRoleDispatchCompletionEnabled } = await import('./core/role-resolver.js');
   const sameTopicSendEnabled = readRoleDispatchCompletionEnabled(appId, targetChatId);
   const exactReportRootEnabled = parsedBotApps.length > 0 && legacyBots.length === 0;
-  const briefWithCompletionProtocol = (dispatchRootId: string): string => buildDispatchCompletionBrief({
-    brief,
-    dispatchRootId,
-    exactReportRootEnabled,
-    sameTopicSendEnabled,
-    resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay',
-  });
   let built;
   try {
     built = buildDispatchMessages({
       title: title.trim() || '子项目',
-      brief: intoRoot && !standby ? briefWithCompletionProtocol(intoRoot) : brief,
+      brief,
       bots,
     });
   } catch (err: any) {
@@ -15113,14 +15106,28 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     if (operation.state !== 'awaiting_proof') process.exitCode = 1;
     return;
   }
-  const intoBriefJson = intoRoot
-    ? JSON.stringify({ zh_cn: { title: '', content: built.threadContent } })
-    : undefined;
+  // The kickoff is rebuilt per root: an exact-root dispatch posts the brief
+  // only and asks the source daemon to bind the completion protocol to that
+  // message as hidden turn context; `content` keeps the inline footer for an
+  // older daemon (and for legacy --bot targets, which may be cross-machine).
+  const kickoffDelivery = (dispatchRootId: string) => buildDispatchKickoffDelivery({
+    title: title.trim() || '子项目',
+    brief,
+    bots,
+    dispatchRootId,
+    exactReportRootEnabled,
+    sameTopicSendEnabled,
+    resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay',
+  });
 
-  const deliverKickoff = async (rootId: string, content: string): Promise<string> => {
+  const deliverKickoff = async (rootId: string): Promise<string> => {
+    const delivery = kickoffDelivery(rootId);
     const response = await postCurrentSessionDaemonRoute({
       path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId, originClaim: dispatchOriginClaim,
-      body: { rootId, chatId: targetChatId, content,
+      body: { rootId, chatId: targetChatId, content: delivery.content,
+        ...(delivery.visibleContent && delivery.completionProtocol ? {
+          visibleContent: delivery.visibleContent, completionProtocol: delivery.completionProtocol,
+        } : {}),
         targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0,
         ...(delegateScheduleCreate ? { delegateScheduleCreate: true } : {}),
         ...(suppressScheduleCreate ? { suppressScheduleCreate: true } : {}) },
@@ -15175,7 +15182,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     // --into: append into an existing thread (activate standby bots / coordinate).
     if (intoRoot) {
       const sentAtMs = Date.now();
-      const kickoffId = await deliverKickoff(intoRoot, intoBriefJson!);
+      const kickoffId = await deliverKickoff(intoRoot);
       const acceptance = parsedBotApps.length > 0
         ? await waitForExactDispatchAcceptance({
             targetAppIds: parsedBotApps.map(item => item.appId),
@@ -15291,17 +15298,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     let kickoffId: string | undefined;
     let acceptance: Awaited<ReturnType<typeof waitForExactDispatchAcceptance>> | undefined;
     if (!standby) {
-      // The seed is now known. Rebuild this turn's kickoff with an immutable
+      // The seed is now known. Build this turn's kickoff with an immutable
       // report command bound to that exact registry key; do not rely on the
       // resident chat-scope session's mutable latest reply alias.
-      const kickoffBuilt = buildDispatchMessages({
-        title: title.trim() || '子项目',
-        brief: briefWithCompletionProtocol(seedId),
-        bots,
-      });
-      const kickoffBriefJson = JSON.stringify({ zh_cn: { title: '', content: kickoffBuilt.threadContent } });
       const sentAtMs = Date.now();
-      kickoffId = await deliverKickoff(seedId, kickoffBriefJson);
+      kickoffId = await deliverKickoff(seedId);
       if (parsedBotApps.length > 0) {
         acceptance = await waitForExactDispatchAcceptance({
           targetAppIds: parsedBotApps.map(item => item.appId),
